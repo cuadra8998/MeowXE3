@@ -97,6 +97,7 @@ git -C "$R/nullmoth" apply "$HERE/0103-drm-clients-labelled-with-their-process.p
 git -C "$R/nullmoth" apply "$HERE/0105-panel-brightness.patch"
 git -C "$R/nullmoth" apply "$HERE/0106-gpu-clock-report.patch"
 git -C "$R/nullmoth" apply "$HERE/0107-clock-report-without-guc-queries.patch"
+git -C "$R/nullmoth" apply "$HERE/0108-panther-lake-shipping-ids.patch"
 echo "patches applied: 50 (ericek) + 0051 (Wildcat Lake) + 0053 (integrated-GPU display bridge) + 0054 (build fixes) + 0055 (bring-up checkpoints, off unless nmxtrace is set) + 0056 (checked BAR mappings) + 0057 (shared BAR mappings kept until the last user) + 0058 (nmxtrace=3 NVRAM breadcrumb) + 0059 (xe display-probe checkpoints) + 0061 (framebuffer publish checkpoints) + 0063 (scan-out buffer checkpoints) + 0065 (stolen scan-out buffer cleared by the CPU) + 0066 (xe GEM vmap) + 0067 (coarse NVRAM breadcrumbs) + 0068 (IOGraphics callback breadcrumbs) + 0069 (interrupt heartbeat) + 0070 (fbstop switch) + 0071 (fbflags switch) + 0072 (NMXGPU stays powered on) + 0073 (fbflags 0x4) + 0074 (flight recorder)"
 
 # 2. drm-kmod with ericek's one patch, FreeBSD and Linux (only the parts the build reads)
@@ -110,6 +111,7 @@ git -C "$SRC/kpi/drm-kmod" apply "$HERE/0076-drm-kmod-display-irq-checkpoints.pa
 git -C "$SRC/kpi/drm-kmod" apply "$HERE/0078-drm-kmod-vblank-path-traces.patch"
 git -C "$SRC/kpi/drm-kmod" apply "$HERE/0100-drm-kmod-flips-without-dsb.patch"
 git -C "$SRC/kpi/drm-kmod" apply "$HERE/0104-drm-kmod-client-pid-is-the-process.patch"
+git -C "$SRC/kpi/drm-kmod" apply "$HERE/0109-drm-kmod-panther-lake-shipping-ids.patch"
 echo "display 30.02 backport applied (0052) + display probe and modeset checkpoints (0060, 0062, 0064)"
 fetch "$SRC/kpi/freebsd-src" https://github.com/freebsd/freebsd-src d2145e9b96448da34d3cfede24c509af6d830c92 \
     sys/compat sys/contrib/ck sys/contrib/dev/acpica

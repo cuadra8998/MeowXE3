@@ -25,8 +25,18 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
 
 Not yet: sleep (disabled), audio, Safari WebGL/YouTube (Safari's sandbox blocks the driver).
 
+> [!CAUTION]
+> **Camera apps (Photo Booth, FaceTime, ...):** the preview is black, and leaving one running for a few minutes has
+> caused a kernel panic. Avoid the camera until this is fixed.
+
 **Tested on:** ASUS Vivobook X1504MA, Intel Wildcat Lake `8086:FD80`, macOS Tahoe 26.7, OpenCore 1.0.8.
-Other Xe3 GPUs (other Wildcat Lake / Panther Lake IDs) are untested; the installer warns you about them.
+
+**In the driver but never run on real hardware:** Wildcat Lake `FD81`, and Panther Lake `B080`–`B087`, `B08F`, `B090`–`B092`,
+`B0A0`–`B0A2`, `B0B0`. They use the same firmware family and display generation, so they have a fair chance, but expect
+problems. The installer warns you, and reports from these machines are very welcome.
+
+**External displays (HDMI / USB-C):** untested. The driver lights every connected output with the same image, so at
+best an external screen **mirrors** the built-in panel. An extended desktop on a second screen is not supported yet.
 
 ## Install
 

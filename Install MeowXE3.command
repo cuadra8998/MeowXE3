@@ -14,7 +14,8 @@ for a in "$@"; do case $a in --dry-run) DRY=1;; --fast) FAST=1;; esac; done
 LOG=/Users/Shared/MeowXE3-install.log
 G=7C436110-AB2A-4BBB-A880-FE41995C9F82
 SUPPORTED="fd80"                         # tested: Wildcat Lake 8086:FD80 (ASUS Vivobook X1504MA)
-XE3_OTHER="fd81 fd82 fd83 fd84 fd85 fd86 fd87 fd88 fd89 fd8a fd8b fd8c fd8d fd8e fd8f b080 b081 b082 b083 b084 b085 b086 b087 b08f b090 b0a0 b0b0"
+# Wildcat Lake FD81 and Panther Lake are in the driver (Linux INTEL_WCL_IDS / INTEL_PTL_IDS) but untested
+XE3_OTHER="fd81 b080 b081 b082 b083 b084 b085 b086 b087 b08f b090 b091 b092 b0a0 b0a1 b0a2 b0b0"   # in the driver, never run on real hardware
 
 # --- look -----------------------------------------------------------------------------------------------------
 GRN=$'\033[0;32m'; BGRN=$'\033[1;92m'; DIM=$'\033[2;32m'; RED=$'\033[1;91m'; YEL=$'\033[1;93m'; RST=$'\033[0m'; BLK=$'\033[40m'
@@ -88,7 +89,7 @@ check_system() { # sets CHECK_FAILED / CHECK_WARN
   if [ "$(uname -m)" = x86_64 ]; then ok "Intel Mac kernel (x86_64)"; else bad "this is not an x86_64 Mac"; CHECK_FAILED=1; fi
   local id; id=$(gpu_id)
   if [[ " $SUPPORTED " == *" $id "* ]]; then ok "GPU 8086:$(echo "$id" | tr a-f A-F) Wildcat Lake Xe3 (tested)"
-  elif [[ " $XE3_OTHER " == *" $id "* ]]; then warn "GPU 8086:$(echo "$id" | tr a-f A-F) is Xe3 but UNTESTED (only FD80 is known to work)"; CHECK_WARN=1
+  elif [[ " $XE3_OTHER " == *" $id "* ]]; then warn "GPU 8086:$(echo "$id" | tr a-f A-F) is Xe3 and in the driver, but UNTESTED (only FD80 is known to work) - please report how it goes"; CHECK_WARN=1
   else bad "GPU '${id:-none}' ($(gpu_vendor)) - MeowXE3 drives Intel Xe3 only"; CHECK_FAILED=1; fi
   if nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version >/dev/null 2>&1; then
     ok "booted by OpenCore $(nvram 4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:opencore-version 2>/dev/null | awk '{print $2}')"

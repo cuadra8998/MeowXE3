@@ -1,0 +1,15 @@
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+@@ -106,9 +106,10 @@
+     return ttm_resource_manager_usage(man);
+ }
+ 
+-/* Panther Lake (Linux 6.14 pciids.h INTEL_PTL_IDS): forced so xe takes it; i915 does not know it */
++/* Panther Lake (Linux 6.14 pciids.h INTEL_PTL_IDS, plus b083-b087 and b08f from current Linux): forced so xe takes it;
++ * i915 does not know it */
+ /* Wildcat Lake (later Linux pciids.h INTEL_WCL_IDS, which current Linux maps to ptl_desc): fd80, fd81 */
+-#define NMX_XE_FORCE_PROBE "b080,b081,b082,b090,b091,b092,b0a0,b0a1,b0a2,b0b0,fd80,fd81"
++#define NMX_XE_FORCE_PROBE "b080,b081,b082,b083,b084,b085,b086,b087,b08f,b090,b091,b092,b0a0,b0a1,b0a2,b0b0,fd80,fd81"
+ 
+ struct xe_modparam xe_modparam = {
+ 	.force_execlist = false,
