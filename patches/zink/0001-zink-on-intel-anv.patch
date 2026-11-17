@@ -1,0 +1,143 @@
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+--- a/src/gallium/drivers/zink/zink_screen.c	2026-11-17 03:47:33
++++ b/src/gallium/drivers/zink/zink_screen.c	2026-11-16 20:23:30
+@@ -72,7 +72,7 @@
+ #include <unistd.h>
+ #if DETECT_OS_APPLE
+ /* See the vulkan-loader-rpath meson option for how to specify rpath at build time. */
+-#define VK_LIBNAME "@rpath/libvulkan.1.dylib"
++#define VK_LIBNAME "/Library/GPUBundles/nvmtl/libvulkan.1.dylib" /* MeowXE3: our Vulkan loader (finds the Intel ANV driver through its manifest) */
+ #elif DETECT_OS_ANDROID
+ #define VK_LIBNAME "libvulkan.so"
+ #else
+@@ -3523,7 +3523,7 @@
+    u_trace_state_init();
+ 
+ #if defined(NVK_ZINK_NVK)
+-   screen->loader_lib = util_dl_open("@rpath/libnvk_zink_vulkan.dylib");
++   screen->loader_lib = util_dl_open(VK_LIBNAME); /* MeowXE3: the Vulkan loader in /Library/GPUBundles/nvmtl, not NVK's private runtime */
+ #else
+    screen->loader_lib = util_dl_open(VK_LIBNAME);
+ #endif
+diff --git a/src/gallium/targets/nvk-zink/nvk_present.c b/src/gallium/targets/nvk-zink/nvk_present.c
+--- a/src/gallium/targets/nvk-zink/nvk_present.c	2026-11-17 03:47:33
++++ b/src/gallium/targets/nvk-zink/nvk_present.c	2026-11-16 20:17:09
+@@ -75,8 +75,13 @@
+                        IOSurfaceRef surface)
+ {
+    struct zink_screen *screen = zink_screen(pscreen);
+-   if (!image || !surface || screen->info.driver_props.driverID != VK_DRIVER_ID_MESA_NVK ||
+-       screen->info.props.vendorID != 0x10de || !screen->info.have_KHR_external_memory_fd ||
++   /* MeowXE3: Intel's ANV on an integrated GPU has no VRAM to import an IOSurface into; it copies straight into the
++    * IOSurface's own system pages (the host-page path below, VK_EXT_external_memory_host). */
++   const bool intel = screen->info.driver_props.driverID == VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA &&
++                      screen->info.props.vendorID == 0x8086 && screen->info.have_EXT_external_memory_host;
++   const bool nvk = screen->info.driver_props.driverID == VK_DRIVER_ID_MESA_NVK &&
++                    screen->info.props.vendorID == 0x10de && screen->info.have_KHR_external_memory_fd;
++   if (!image || !surface || !(nvk || intel) ||
+        IOSurfaceGetPlaneCount(surface) > 1 || IOSurfaceGetPixelFormat(surface) != 0x42475241 ||
+        IOSurfaceGetWidth(surface) != image->width0 || IOSurfaceGetHeight(surface) != image->height0 ||
+        IOSurfaceGetBytesPerElement(surface) != 4 || image->format != PIPE_FORMAT_B8G8R8A8_UNORM)
+@@ -89,20 +94,24 @@
+    /* Resolve private hooks only from the ICD implementing this exact device's
+     * command entrypoint. A loader/layer wrapper or unrelated NVK image is
+     * rejected rather than passing foreign handles to a private ABI. */
+-   if (!util_dl_get_proc_address(screen->loader_lib, "nvkbridgeSetPresentObserver")) return 0;
+-   PFN_vkVoidFunction copy = screen->vk_GetDeviceProcAddr(screen->dev, "vkCmdCopyImageToBuffer");
+-   Dl_info origin = {0};
+-   if (!copy || !dladdr((void *)copy, &origin) || !origin.dli_fname) return 0;
++   if (!intel && !util_dl_get_proc_address(screen->loader_lib, "nvkbridgeSetPresentObserver")) return 0;
+    struct copy_frame *frame = calloc(1, sizeof(*frame));
+    if (!frame) return 0;
+-   frame->renderer = dlopen(origin.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_FIRST | RTLD_NOLOAD);
+-   if (!frame->renderer) { free(frame); return 0; }
+-   PFN_vkGetInstanceProcAddr gipa = (void *)dlsym(frame->renderer, "vk_icdGetInstanceProcAddr");
+-   PFN_vkGetDeviceProcAddr gdpa = gipa ? (void *)gipa(screen->instance, "vkGetDeviceProcAddr") : NULL;
+-   stage_import_fn stage = (void *)dlsym(frame->renderer, "nvmtl_nvk_stage_import");
+-   surface_dirty_fn dirty = (void *)dlsym(frame->renderer, "nvmtl_nvk_surface_dirty");
+-   if (!gdpa || gdpa(screen->dev, "vkCmdCopyImageToBuffer") != copy || !stage || !dirty)
+-      goto failed;
++   stage_import_fn stage = NULL;
++   surface_dirty_fn dirty = NULL;
++   if (!intel) {
++      PFN_vkVoidFunction copy = screen->vk_GetDeviceProcAddr(screen->dev, "vkCmdCopyImageToBuffer");
++      Dl_info origin = {0};
++      if (!copy || !dladdr((void *)copy, &origin) || !origin.dli_fname) { free(frame); return 0; }
++      frame->renderer = dlopen(origin.dli_fname, RTLD_NOW | RTLD_LOCAL | RTLD_FIRST | RTLD_NOLOAD);
++      if (!frame->renderer) { free(frame); return 0; }
++      PFN_vkGetInstanceProcAddr gipa = (void *)dlsym(frame->renderer, "vk_icdGetInstanceProcAddr");
++      PFN_vkGetDeviceProcAddr gdpa = gipa ? (void *)gipa(screen->instance, "vkGetDeviceProcAddr") : NULL;
++      stage = (void *)dlsym(frame->renderer, "nvmtl_nvk_stage_import");
++      dirty = (void *)dlsym(frame->renderer, "nvmtl_nvk_surface_dirty");
++      if (!gdpa || gdpa(screen->dev, "vkCmdCopyImageToBuffer") != copy || !stage || !dirty)
++         goto failed;
++   }
+    frame->surface = (IOSurfaceRef)CFRetain(surface);
+    pipe_resource_reference(&frame->image, image);
+    VkExternalMemoryBufferCreateInfo external = { .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+@@ -110,27 +119,32 @@
+    VkBufferCreateInfo buffer = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .pNext = &external,
+       .size = row * image->height0, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+       .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+-   if (screen->vk.CreateBuffer(screen->dev, &buffer, NULL, &frame->buffer) != VK_SUCCESS) goto failed;
+-   VkMemoryRequirements requirements;
+-   screen->vk.GetBufferMemoryRequirements(screen->dev, frame->buffer, &requirements);
+-   if (requirements.size > size) goto failed;
+-   uint32_t type;
+-   for (type = 0; type < screen->info.mem_props.memoryTypeCount; ++type)
+-      if ((requirements.memoryTypeBits & (1u << type)) &&
+-          (screen->info.mem_props.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) break;
+-   if (type == screen->info.mem_props.memoryTypeCount) goto failed;
+-   int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+-   if (fd < 0) goto failed;
++   VkMemoryRequirements requirements = {0};
++   uint32_t type = 0;
++   int fd = -1;
+    VkImportMemoryFdInfoKHR imported = { .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+-      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = fd };
+-   VkMemoryAllocateInfo allocation = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+-      .pNext = &imported, .allocationSize = requirements.size, .memoryTypeIndex = type };
+-   const struct surface_import record = {3, IOSurfaceGetID(surface), 0, 0, requirements.size};
+-   stage(&record);
+-   VkResult result = screen->vk.AllocateMemory(screen->dev, &allocation, NULL, &frame->memory);
+-   stage(NULL); /* Clear thread-local staged imports on every allocation result. */
++      .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, .fd = -1 };
++   VkMemoryAllocateInfo allocation = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imported };
++   VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;   /* Intel: straight to the host-page import */
++   if (!intel) {
++      if (screen->vk.CreateBuffer(screen->dev, &buffer, NULL, &frame->buffer) != VK_SUCCESS) goto failed;
++      screen->vk.GetBufferMemoryRequirements(screen->dev, frame->buffer, &requirements);
++      if (requirements.size > size) goto failed;
++      for (type = 0; type < screen->info.mem_props.memoryTypeCount; ++type)
++         if ((requirements.memoryTypeBits & (1u << type)) &&
++             (screen->info.mem_props.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) break;
++      if (type == screen->info.mem_props.memoryTypeCount) goto failed;
++      fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
++      if (fd < 0) goto failed;
++      imported.fd = fd;
++      allocation.allocationSize = requirements.size; allocation.memoryTypeIndex = type;
++      const struct surface_import record = {3, IOSurfaceGetID(surface), 0, 0, requirements.size};
++      stage(&record);
++      result = screen->vk.AllocateMemory(screen->dev, &allocation, NULL, &frame->memory);
++      stage(NULL); /* Clear thread-local staged imports on every allocation result. */
++   }
+    if (result != VK_SUCCESS) {
+-      close(fd);
++      if (fd >= 0) close(fd);
+       /* A small BAR1 aperture can be full while ordinary GPU memory remains
+        * available. Copy directly into the IOSurface's imported system pages
+        * in that case. No CPU reads or copies of game pixels are involved.
+diff --git a/src/gallium/targets/nvk-zink/nvk_zink.c b/src/gallium/targets/nvk-zink/nvk_zink.c
+--- a/src/gallium/targets/nvk-zink/nvk_zink.c	2026-11-17 03:47:33
++++ b/src/gallium/targets/nvk-zink/nvk_zink.c	2026-11-16 20:17:09
+@@ -453,7 +453,9 @@
+ {
+    if (!ctx || !vendor || !device || p_atomic_read(&ctx->screen->uncertain)) return 0;
+    struct zink_screen *screen = zink_screen(ctx->screen->fscreen.screen);
+-   if (screen->info.driver_props.driverID != VK_DRIVER_ID_MESA_NVK) return 0;
++   /* MeowXE3: also Intel's ANV (MeowXE3's Vulkan driver), matched to its Metal device by vendor/device id */
++   if (screen->info.driver_props.driverID != VK_DRIVER_ID_MESA_NVK &&
++       screen->info.driver_props.driverID != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) return 0;
+    *vendor = screen->info.props.vendorID; *device = screen->info.props.deviceID;
+    return 1;
+ }

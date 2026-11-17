@@ -1,0 +1,268 @@
+diff --git a/zink/native_drawable.m b/zink/native_drawable.m
+--- a/zink/native_drawable.m	2026-11-16 15:34:55
++++ b/zink/native_drawable.m	2026-11-16 20:18:11
+@@ -35,9 +35,11 @@
+  * matching the native Minecraft runtime's current qualification limit. */
+ static id<MTLDevice> metal_device(uint32_t vendor, uint32_t deviceID)
+ {
+-   if (vendor != 0x10de) return nil;
++   /* MeowXE3: the Intel Xe3 GPU's accelerator is NMXAccel (MeowXE3Accel), on the same PCI device */
++   const char *accel = vendor == 0x10de ? "NVAccel" : vendor == 0x8086 ? "NMXAccel" : NULL;
++   if (!accel) return nil;
+    io_iterator_t iterator = 0;
+-   if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("NVAccel"), &iterator)) return nil;
++   if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching(accel), &iterator)) return nil;
+    uint64_t selected = 0; unsigned matches = 0;
+    for (io_service_t service; (service = IOIteratorNext(iterator)); IOObjectRelease(service)) {
+       io_registry_entry_t parent = 0;
+diff --git a/zink/nvk_cgl.c b/zink/nvk_cgl.c
+--- a/zink/nvk_cgl.c	2026-11-16 15:34:55
++++ b/zink/nvk_cgl.c	2026-11-17 02:54:06
+@@ -9,6 +9,7 @@
+ #include <execinfo.h>
+ #include <malloc/malloc.h>
+ #include <pthread.h>
++#include <time.h>
+ #include <stdatomic.h>
+ #include <stdbool.h>
+ #include <stdint.h>
+@@ -43,6 +44,8 @@
+       GLsync fence;
+    } gpu_present[2];
+    unsigned gpu_width, gpu_height, gpu_slot;
++   bool gpu_pending[2];      /* MeowXE3: a Zink copy submitted into this slot, its IOSurface still locked */
++   uint64_t gpu_last_swap;   /* MeowXE3: when the last frame was presented (continuous rendering = pipelined) */
+    bool present_configured, gpu_disabled, native_present, native_required, apple_uncertain;
+    void *driver;
+    void **engine_back;
+@@ -767,6 +770,12 @@
+ static void release_gpu_present(struct nvk_cgl_bridge *b)
+ {
+    if (b->apple_uncertain) return;
++   /* MeowXE3: pipelined copies still write their IOSurfaces; finish them (and unlock) first */
++   for (unsigned i = 0; i < 2; ++i) if (b->gpu_pending[i] && b->zink) {
++      if (!nvk_zink_present_wait(b->zink, i)) nvk_zink_present_release(b->zink);
++      IOSurfaceUnlock(b->gpu_present[i].surface, 0, NULL);
++      b->gpu_pending[i] = false;
++   }
+    bool current = b->context == CGLGetCurrentContext();
+    if (current) {
+       drain_native_cleanups(b);
+@@ -817,9 +826,11 @@
+    return surface;
+ }
+ 
++static int gpu_flush_pending(struct nvk_cgl_bridge *b, bool show);
+ static int prepare_gpu_present(struct nvk_cgl_bridge *b)
+ {
+    if (b->gpu_width == b->width && b->gpu_height == b->height) return 1;
++   if (!gpu_flush_pending(b, false)) return 0;   /* MeowXE3: no copy may still write the slots being replaced */
+    if (!reserve_native_cleanup(b)) return 0;
+    release_gpu_present(b);
+    if (b->apple_uncertain || !nvk_zink_make_current(b->zink)) return 0;
+@@ -846,36 +857,40 @@
+    return 0;
+ }
+ 
++/*
++ * MeowXE3: kCGLCPSurfaceOpacity is a round trip to WindowServer (SLSGetSurfaceOpacity); asked on every present it took
++ * 13% of Minecraft 1.12.2's render thread. A window's opacity changes rarely: ask at most every 500 ms per context.
++ */
+ static bool opaque_drawable(CGLContextObj context)
+ {
++   static struct { CGLContextObj context; uint64_t asked; bool opaque; } cache[8];
++   static pthread_mutex_t cache_lock = PTHREAD_MUTEX_INITIALIZER;
++   const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++   pthread_mutex_lock(&cache_lock);
++   for (unsigned i = 0; i < 8; ++i)
++      if (cache[i].context == context && now - cache[i].asked < 500000000ull) {
++         bool opaque = cache[i].opaque;
++         pthread_mutex_unlock(&cache_lock);
++         return opaque;
++      }
++   pthread_mutex_unlock(&cache_lock);
+    GLint opacity = 1;
+    CGLGetParameter(context, kCGLCPSurfaceOpacity, &opacity);
++   pthread_mutex_lock(&cache_lock);
++   unsigned slot = 0;
++   for (unsigned i = 0; i < 8; ++i) {
++      if (cache[i].context == context) { slot = i; break; }
++      if (cache[i].asked < cache[slot].asked) slot = i;
++   }
++   cache[slot].context = context; cache[slot].asked = now; cache[slot].opaque = opacity != 0;
++   pthread_mutex_unlock(&cache_lock);
+    return opacity != 0;
+ }
+ 
+-static int gpu_present(struct nvk_cgl_bridge *b)
++/* Apple-side half of a GPU presentation: blit a finished slot into the window and flush it. */
++static int gpu_blit(struct nvk_cgl_bridge *b, unsigned slot)
+ {
+-   unsigned slot = b->gpu_slot;
+    use_original(b);
+-   if (b->gpu_present[slot].fence) {
+-      GLenum result;
+-      result = glClientWaitSync(b->gpu_present[slot].fence,
+-                                GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ULL);
+-      glDeleteSync(b->gpu_present[slot].fence);
+-      b->gpu_present[slot].fence = NULL;
+-      if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) { b->apple_uncertain = true; use_zink(b); return fail("Apple IOSurface fence wait failed"); }
+-   }
+-   use_zink(b);
+-   IOSurfaceRef surface = b->gpu_present[slot].surface;
+-   if (IOSurfaceLock(surface, 0, NULL) != kIOReturnSuccess) return fail("Cannot lock GPU presentation surface");
+-   int ok = nvk_zink_present_begin(b->zink, slot, 1, opaque_drawable(b->context));
+-   if (!nvk_zink_present_wait(b->zink, slot)) {
+-      nvk_zink_present_release(b->zink);
+-      ok = 0;
+-   }
+-   ok &= IOSurfaceUnlock(surface, 0, NULL) == kIOReturnSuccess;
+-   if (!ok) return fail("Zink IOSurface GPU copy failed");
+-   use_original(b);
+    if (!b->present_fbo) glGenFramebuffers(1, &b->present_fbo);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, b->present_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+@@ -900,6 +915,74 @@
+       b->apple_uncertain = true;
+       return fail("Apple IOSurface blit or swap failed; resources quarantined");
+    }
++   return 1;
++}
++
++/* Waits for a pipelined Zink copy and unlocks its IOSurface (the Apple side may read it from now on). */
++static int gpu_settle(struct nvk_cgl_bridge *b, unsigned slot)
++{
++   if (!b->gpu_pending[slot]) return 1;
++   int ok = nvk_zink_present_wait(b->zink, slot);
++   if (!ok) nvk_zink_present_release(b->zink);
++   ok &= IOSurfaceUnlock(b->gpu_present[slot].surface, 0, NULL) == kIOReturnSuccess;
++   b->gpu_pending[slot] = false;
++   return ok;
++}
++
++/* Finishes pipelined frames; with show, the newest one goes to the window (detach, resize). */
++static int gpu_flush_pending(struct nvk_cgl_bridge *b, bool show)
++{
++   int newest = -1;
++   for (unsigned i = 0; i < 2; ++i) if (b->gpu_pending[i]) newest = (int)i;
++   if (b->gpu_pending[0] && b->gpu_pending[1]) newest = (int)(b->gpu_slot ^ 1);
++   int ok = 1;
++   for (unsigned i = 0; i < 2; ++i) ok &= gpu_settle(b, i);
++   if (ok && show && newest >= 0 && !b->apple_uncertain) ok = gpu_blit(b, (unsigned)newest);
++   return ok;
++}
++
++static int gpu_present(struct nvk_cgl_bridge *b)
++{
++   unsigned slot = b->gpu_slot, prev = slot ^ 1;
++   /*
++    * MeowXE3: one-frame pipeline for continuous rendering (a swap within 100 ms of the previous one, i.e. a game).
++    * Waiting for Zink's copy before Apple's blit serialised CPU and GPU (Minecraft 1.12.2: 16% of the render thread
++    * in fence_finish, 30 fps). Pipelined, this frame's copy is submitted and the previous frame - whose copy has
++    * normally completed - is shown. Occasional presents (UI apps) stay synchronous so their last frame shows at once.
++    * Opt-in (NVKZINK_PIPELINE=1): it did not raise Minecraft 1.12.2 above 30 fps (GPU-bound) and was a suspect in hangs.
++    */
++   static int pipeline_env = -1;
++   if (pipeline_env < 0) { const char *e = getenv("NVKZINK_PIPELINE"); pipeline_env = e && e[0] == '1'; }   /* MeowXE3: opt-in */
++   const uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++   const bool pipelined = pipeline_env && b->gpu_last_swap && now - b->gpu_last_swap < 100000000ull;
++   b->gpu_last_swap = now;
++   use_original(b);
++   if (b->gpu_present[slot].fence) {
++      GLenum result;
++      result = glClientWaitSync(b->gpu_present[slot].fence,
++                                GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ULL);
++      glDeleteSync(b->gpu_present[slot].fence);
++      b->gpu_present[slot].fence = NULL;
++      if (result != GL_ALREADY_SIGNALED && result != GL_CONDITION_SATISFIED) { b->apple_uncertain = true; use_zink(b); return fail("Apple IOSurface fence wait failed"); }
++   }
++   use_zink(b);
++   if (!gpu_settle(b, slot)) return fail("Zink IOSurface GPU copy failed");
++   IOSurfaceRef surface = b->gpu_present[slot].surface;
++   if (IOSurfaceLock(surface, 0, NULL) != kIOReturnSuccess) return fail("Cannot lock GPU presentation surface");
++   if (!nvk_zink_present_begin(b->zink, slot, 1, opaque_drawable(b->context))) {
++      nvk_zink_present_release(b->zink);
++      IOSurfaceUnlock(surface, 0, NULL);
++      return fail("Zink IOSurface GPU copy failed");
++   }
++   b->gpu_pending[slot] = true;
++   if (pipelined && b->gpu_pending[prev]) {
++      if (!gpu_settle(b, prev)) return fail("Zink IOSurface GPU copy failed");
++      if (!gpu_blit(b, prev)) return 0;
++   } else {
++      /* Synchronous: a newer frame supersedes an older pipelined one, which is only finished. */
++      if (!gpu_settle(b, prev) || !gpu_settle(b, slot)) return fail("Zink IOSurface GPU copy failed");
++      if (!gpu_blit(b, slot)) return 0;
++   }
+    b->gpu_slot ^= 1;
+    return nvk_zink_swap(b->zink);
+ }
+@@ -921,6 +1004,12 @@
+       b->gpu_disabled = mode && !strcmp(mode, "cpu");
+       b->native_required = mode && !strcmp(mode, "native");
+       b->native_present = !mode || !strcmp(mode, "auto") || b->native_required;
++      /* MeowXE3: on Intel ANV, automatic mode presents through the IOSurface + Apple GL path (validated:
++       * NSOpenGLView, AppKit queued surfaces, pixels). Direct drawable copies are not qualified there yet;
++       * NVKZINK_PRESENT=native still selects them. */
++      uint32_t vendor = 0, device = 0;
++      if (!b->native_required && nvk_zink_device_info(b->zink, &vendor, &device) && vendor == 0x8086)
++         b->native_present = false;
+       b->present_configured = true;
+    }
+    if (b->native_present) {
+@@ -1049,6 +1138,7 @@
+    pthread_mutex_unlock(&bridges_lock);
+    if (!b) { CGLUnlockContext(context); return fail("Context is not attached"); }
+    nvk_native_remove(b->context);
++   if (!b->apple_uncertain) gpu_flush_pending(b, true);   /* MeowXE3: the window ends on its newest frame */
+    release_gpu_present(b);
+    use_original(b);
+    bool automatic = b->automatic;
+diff --git a/tools/cgl_zink_legacy_probe.c b/tools/cgl_zink_legacy_probe.c
+--- a/tools/cgl_zink_legacy_probe.c	2026-11-16 20:14:18
++++ b/tools/cgl_zink_legacy_probe.c	2026-11-16 20:24:24
+@@ -168,7 +168,7 @@
+    printf("GL_VENDOR=%s\nGL_RENDERER=%s\nGL_VERSION=%s\n", glGetString(GL_VENDOR),
+           glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    CHECK(strstr((const char *)glGetString(GL_RENDERER), "zink"));
+-   CHECK(strstr((const char *)glGetString(GL_RENDERER), "NVK"));
++   CHECK((strstr((const char *)glGetString(GL_RENDERER), "NVK") || strstr((const char *)glGetString(GL_RENDERER), "INTEL_OPEN_SOURCE_MESA")));
+    CHECK(strstr((const char *)glGetString(GL_VERSION), "Compatibility"));
+    fixed_function_test(); GLuint texture = texture_test();
+    buffer_framebuffer_test(); arb_shader_test();
+diff --git a/tools/cgl_zink_probe.c b/tools/cgl_zink_probe.c
+--- a/tools/cgl_zink_probe.c	2026-11-16 20:14:18
++++ b/tools/cgl_zink_probe.c	2026-11-16 20:24:13
+@@ -241,7 +241,7 @@
+    printf("GL_VENDOR=%s\nGL_RENDERER=%s\nGL_VERSION=%s\n",
+       glGetString(GL_VENDOR), glGetString(GL_RENDERER), glGetString(GL_VERSION));
+    CHECK(strstr((const char *)glGetString(GL_RENDERER), "zink"));
+-   CHECK(strstr((const char *)glGetString(GL_RENDERER), "NVK"));
++   CHECK(strstr((const char *)glGetString(GL_RENDERER), "NVK") || strstr((const char *)glGetString(GL_RENDERER), "INTEL_OPEN_SOURCE_MESA"));
+    GLuint vs = shader(GL_VERTEX_SHADER, "#version 410 core\nvoid main(){vec2 p[3]=vec2[3](vec2(-.8,-.8),vec2(.8,-.8),vec2(0,.8));gl_Position=vec4(p[gl_VertexID],0,1);}");
+    GLuint fs = shader(GL_FRAGMENT_SHADER, "#version 410 core\nuniform vec4 color;out vec4 c;void main(){c=color;}");
+    GLuint program = glCreateProgram();
+diff --git a/tools/cgl_zink_window_probe.m b/tools/cgl_zink_window_probe.m
+--- a/tools/cgl_zink_window_probe.m	2026-11-16 20:14:18
++++ b/tools/cgl_zink_window_probe.m	2026-11-16 20:24:54
+@@ -162,7 +162,7 @@
+       if (!system && !attach(ctx, 128, 128)) { fprintf(stderr, "%s\n", error()); return 1; }
+       const char *renderer = (const char *)glGetString(GL_RENDERER);
+       printf("native_window_renderer=%s\n", renderer ? renderer : "(null)");
+-      if (!renderer || !strstr(renderer, "zink") || !strstr(renderer, "NVK")) return 1;
++      if (!renderer || !strstr(renderer, "zink") || !(strstr(renderer, "NVK") || strstr(renderer, "INTEL_OPEN_SOURCE_MESA"))) return 1;
+       GLint double_buffer = 0; glGetIntegerv(GL_DOUBLEBUFFER, &double_buffer);
+       if (!double_buffer) { fprintf(stderr, "Mesa drawable is not double buffered\n"); return 1; }
+       GLint width = 128, height = 128;
+diff --git a/tools/zink_probe.c b/tools/zink_probe.c
+--- a/tools/zink_probe.c	2026-11-16 20:14:18
++++ b/tools/zink_probe.c	2026-11-16 20:23:50
+@@ -86,7 +86,7 @@
+    GLPROC(void, glDeleteProgram, (GLuint));
+    const char *renderer = (const char *)glGetString(GL_RENDERER);
+    printf("GL_VENDOR=%s\nGL_RENDERER=%s\nGL_VERSION=%s\n", glGetString(GL_VENDOR), renderer, glGetString(GL_VERSION));
+-   if (!renderer || !strstr(renderer, "zink") || !strstr(renderer, "NVK")) die("Renderer is not Zink on NVK");
++   if (!renderer || !strstr(renderer, "zink") || !(strstr(renderer, "NVK") || strstr(renderer, "INTEL_OPEN_SOURCE_MESA"))) die("Renderer is not Zink on NVK or Intel ANV");
+    const char *sources[] = {
+       "#version 410 core\nconst vec2 p[3]=vec2[3](vec2(-.8,-.8),vec2(.8,-.8),vec2(0,.8)); void main(){gl_Position=vec4(p[gl_VertexID],0,1);}",
+       rgbx ? "#version 410 core\nout vec4 color; void main(){color=vec4(0,1,0,0);}" :

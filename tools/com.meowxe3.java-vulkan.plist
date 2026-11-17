@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.meowxe3.java-vulkan</string>
+	<!-- MeowXE3: every Java program started in this login session uses MeowXE3's Vulkan driver (through the loader in
+	     /Library/GPUBundles/nvmtl) instead of LWJGL's bundled MoltenVK. Minecraft 26.3+ then renders natively when
+	     Vulkan is selected. Remove: launchctl unload this file, delete it, and run launchctl unsetenv JAVA_TOOL_OPTIONS. -->
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/launchctl</string>
+		<string>setenv</string>
+		<string>JAVA_TOOL_OPTIONS</string>
+		<string>-Dorg.lwjgl.vulkan.libname=/Library/GPUBundles/nvmtl/libvulkan.1.dylib</string>
+	</array>
+	<key>RunAtLoad</key><true/>
+</dict>
+</plist>

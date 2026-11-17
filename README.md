@@ -98,6 +98,10 @@ Every app is allowed by default (`*` in `/Library/GPUBundles/nvmtl-allow.txt`). 
 | `patches/nmxgpu/` | kernel driver patches for Wildcat Lake on NullMoth's NMXGPU (xe + i915 display on LinuxKPI) |
 | `patches/nvidia-macos-driver/` | NMXAccel and Metal plugin patches |
 | `patches/mesa/` | Mesa ANV patches (macOS Metal window surfaces) |
+| `patches/zink/` | Zink on Intel: `0001` on Mesa 26.3.0 @0a6fa60 after HighDelay's `prepare_zink.py`, `0002` on HighDelay's CGL/GLD bridge |
+| `tools/build/` | build and install scripts for Mesa ANV, Zink, the translator and the Metal plugin (expect sources under `$NMX`, default `~/nmx`) |
+| `tools/tests/` | Metal regression tests (compute, render, mipmapped buffer textures) |
+| `tools/com.meowxe3.java-vulkan.plist` | optional LaunchAgent: every Java program uses MeowXE3's Vulkan driver |
 | `src/MeowXE3Boot/` | the small OpenCore-injected kext |
 
 The binaries (about 340 MB, including LLVM) are in the release zip, not in git.
