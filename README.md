@@ -13,17 +13,28 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
         > ^ <
 ```
 
-## What works
+## What works and what doesn't
 
-| | |
-|---|---|
-| GPU compositing | WindowServer draws on the GPU, panel page flips without tearing |
-| Metal | apps, System Information shows Metal, Maps, Chromium WebGL |
-| Vulkan | native Intel Vulkan driver for apps (Minecraft 26.3+ at 60 fps) |
-| OpenGL | through Mesa Zink on the Vulkan driver (Minecraft 1.12.2 and other GL apps) |
-| Display | built-in panel, brightness slider (brightness keys on the X1504MA: [guide](docs/X1504MA-brightness-keys.md)) |
+| Feature | Status | Notes |
+|---|:---:|---|
+| Graphics acceleration (GPU compositing) | ✅ Works | WindowServer draws on the GPU; smooth animations |
+| Tear-free display | ✅ Works | page flips on the built-in panel |
+| Metal | ✅ Works | Metal 3; shown in System Information |
+| Vulkan | ✅ Works | native Intel driver for apps (Minecraft 26.3+ at 60 fps) |
+| OpenGL | ✅ Works | through Mesa Zink (Minecraft 1.12.2 at ~30 fps) |
+| WebGL in Chrome / Chromium browsers | ✅ Works | |
+| Dock badges, login picture, Dock blur | ✅ Works | |
+| Brightness slider | ✅ Works | |
+| Brightness keys | ✅ Works | X1504MA needs two DSDT edits: [guide](docs/X1504MA-brightness-keys.md) |
+| Shutdown / restart | ✅ Works | |
+| External displays (HDMI / USB-C) | ⚠️ Untested | at best mirrors the built-in panel; no extended desktop |
+| Panther Lake, Wildcat Lake `FD81` | ⚠️ Untested | in the driver, never run on real hardware |
+| Sleep | ❌ Doesn't work | the firmware's sleep fails; sleep is turned off |
+| Internal speakers / headphone jack | ❌ Doesn't work | the Realtek codec is on SoundWire, which needs Intel's DSP firmware. USB or Bluetooth audio should work instead (untested) |
+| Camera (Photo Booth, FaceTime, ...) | ❌ Doesn't work | black preview, and it can cause a kernel panic: **avoid** |
+| Safari WebGL / YouTube | ❌ Doesn't work | Safari's sandbox blocks the driver; YouTube also needs an audio output (USB or Bluetooth, untested) |
 
-Not yet: sleep (disabled), audio, Safari WebGL/YouTube (Safari's sandbox blocks the driver).
+Details and what has been tried: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 > [!CAUTION]
 > **Camera apps (Photo Booth, FaceTime, ...):** the preview is black, and leaving one running for a few minutes has
