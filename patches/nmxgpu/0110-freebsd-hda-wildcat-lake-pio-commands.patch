@@ -1,0 +1,95 @@
+diff --git a/sys/dev/sound/pci/hda/hdac.c b/sys/dev/sound/pci/hda/hdac.c
+index d397e98..bd9fc50 100644
+--- a/sys/dev/sound/pci/hda/hdac.c
++++ b/sys/dev/sound/pci/hda/hdac.c
+@@ -58,6 +58,12 @@
+ #define HDAC_QUIRK_64BIT	(1 << 0)
+ #define HDAC_QUIRK_DMAPOS	(1 << 1)
+ #define HDAC_QUIRK_MSI		(1 << 2)
++/*
++ * MeowXE3: codec verbs through the Immediate Command interface (ICOI/ICII/ICIS) instead of CORB/RIRB, as Linux does for
++ * Lunar Lake and later (AZX_DCAPS_PIO_COMMANDS: Panther Lake, Wildcat Lake). These controllers come up in the audio DSP's
++ * PCI class (04:01); with no DSP firmware the HD Audio link is driven directly.
++ */
++#define HDAC_QUIRK_PIO		(1 << 3)
+ 
+ static const struct {
+ 	const char *key;
+@@ -66,6 +72,7 @@ static const struct {
+ 	{ "64bit", HDAC_QUIRK_64BIT },
+ 	{ "dmapos", HDAC_QUIRK_DMAPOS },
+ 	{ "msi", HDAC_QUIRK_MSI },
++	{ "pio", HDAC_QUIRK_PIO },
+ };
+ 
+ MALLOC_DEFINE(M_HDAC, "hdac", "HDA Controller");
+@@ -122,6 +129,9 @@ static const struct {
+ 	{ HDA_INTEL_ARLS,    "Intel Arrow Lake-S",	0, 0 },
+ 	{ HDA_INTEL_ARL,     "Intel Arrow Lake",	0, 0 },
+ 	{ HDA_INTEL_LNLP,    "Intel Lunar Lake-P",	0, 0 },
++	{ HDA_INTEL_PTL,     "Intel Panther Lake",	HDAC_QUIRK_PIO, 0 },
++	{ HDA_INTEL_PTLH,    "Intel Panther Lake-H",	HDAC_QUIRK_PIO, 0 },
++	{ HDA_INTEL_WCL,     "Intel Wildcat Lake",	HDAC_QUIRK_PIO, 0 },
+ 	{ HDA_INTEL_82801F,  "Intel 82801F",	0, 0 },
+ 	{ HDA_INTEL_63XXESB, "Intel 631x/632xESB",	0, 0 },
+ 	{ HDA_INTEL_82801G,  "Intel 82801G",	0, 0 },
+@@ -1031,6 +1041,36 @@ hdac_unsolq_flush(struct hdac_softc *sc)
+  *
+  * Wrapper function that sends only one command to a given codec
+  ****************************************************************************/
++/* ICIS bits: ICB (busy, set to send) and IRV (a response is valid, write 1 to clear) */
++#define HDAC_ICIS_ICB	0x0001
++#define HDAC_ICIS_IRV	0x0002
++
++static uint32_t
++hdac_send_command_pio(struct hdac_softc *sc, nid_t cad, uint32_t verb)
++{
++	int timeout;
++
++	for (timeout = 1000; timeout > 0; timeout--) {
++		if ((HDAC_READ_2(&sc->mem, HDAC_ICIS) & HDAC_ICIS_ICB) == 0)
++			break;
++		DELAY(1);
++	}
++	if (timeout == 0) {
++		device_printf(sc->dev, "PIO command 0x%08x: interface busy on address %d\n", verb, cad);
++		return (HDA_INVALID);
++	}
++	HDAC_WRITE_2(&sc->mem, HDAC_ICIS, HDAC_READ_2(&sc->mem, HDAC_ICIS) | HDAC_ICIS_IRV);
++	HDAC_WRITE_4(&sc->mem, HDAC_ICOI, verb);
++	HDAC_WRITE_2(&sc->mem, HDAC_ICIS, HDAC_READ_2(&sc->mem, HDAC_ICIS) | HDAC_ICIS_ICB);
++	for (timeout = 1000; timeout > 0; timeout--) {
++		if (HDAC_READ_2(&sc->mem, HDAC_ICIS) & HDAC_ICIS_IRV)
++			return (HDAC_READ_4(&sc->mem, HDAC_ICII));
++		DELAY(1);
++	}
++	device_printf(sc->dev, "PIO command 0x%08x timeout on address %d\n", verb, cad);
++	return (HDA_INVALID);
++}
++
+ static uint32_t
+ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
+ {
+@@ -1041,6 +1081,8 @@ hdac_send_command(struct hdac_softc *sc, nid_t cad, uint32_t verb)
+ 	verb &= ~HDA_CMD_CAD_MASK;
+ 	verb |= ((uint32_t)cad) << HDA_CMD_CAD_SHIFT;
+ 	sc->codecs[cad].response = HDA_INVALID;
++	if (sc->quirks_on & HDAC_QUIRK_PIO)
++		return (sc->codecs[cad].response = hdac_send_command_pio(sc, cad, verb));
+ 
+ 	sc->codecs[cad].pending++;
+ 	sc->corb_wp++;
+diff --git a/sys/dev/sound/pci/hda/hdac.h b/sys/dev/sound/pci/hda/hdac.h
+index 36fd7b6..65c576b 100644
+--- a/sys/dev/sound/pci/hda/hdac.h
++++ b/sys/dev/sound/pci/hda/hdac.h
+@@ -103,6 +103,9 @@
+ #define HDA_INTEL_ARLS		HDA_MODEL_CONSTRUCT(INTEL, 0x7f50)
+ #define HDA_INTEL_ARL		HDA_MODEL_CONSTRUCT(INTEL, 0x7728)
+ #define HDA_INTEL_LNLP		HDA_MODEL_CONSTRUCT(INTEL, 0xa828)
++#define HDA_INTEL_PTL		HDA_MODEL_CONSTRUCT(INTEL, 0xe428)
++#define HDA_INTEL_PTLH		HDA_MODEL_CONSTRUCT(INTEL, 0xe328)
++#define HDA_INTEL_WCL		HDA_MODEL_CONSTRUCT(INTEL, 0x4d28)
+ #define INTEL_A100ID_SUBVENDOR	HDA_MODEL_CONSTRUCT(INTEL, 0xa100)
+ #define INTEL_D400ID_SUBVENDOR	HDA_MODEL_CONSTRUCT(INTEL, 0xd400)
+ #define INTEL_D401ID_SUBVENDOR	HDA_MODEL_CONSTRUCT(INTEL, 0xd401)
