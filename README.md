@@ -27,7 +27,8 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
 | Brightness slider | ✅ Works | |
 | Brightness keys | ✅ Works | X1504MA needs two DSDT edits: [guide](docs/X1504MA-brightness-keys.md) |
 | Shutdown / restart | ✅ Works | |
-| External displays (HDMI / USB-C) | ⚠️ Untested | at best mirrors the built-in panel; no extended desktop |
+| HDMI display | ⚠️ Partly | works only if the monitor is connected **when the Mac boots**; plugging it in later doesn't. Same image as the built-in panel (no extended desktop). **No HDMI audio** |
+| USB-C / DisplayPort display | ⚠️ Untested | |
 | Panther Lake, Wildcat Lake `FD81` | ⚠️ Untested | in the driver, never run on real hardware |
 | Sleep | ❌ Doesn't work | the firmware's sleep fails; sleep is turned off |
 | Internal speakers / headphone jack | ❌ Doesn't work | the Realtek codec is on SoundWire, which needs Intel's DSP firmware. USB or Bluetooth audio should work instead (untested) |
@@ -46,8 +47,9 @@ Details and what has been tried: [docs/FINDINGS.md](docs/FINDINGS.md).
 `B0A0`–`B0A2`, `B0B0`. They use the same firmware family and display generation, so they have a fair chance, but expect
 problems. The installer warns you, and reports from these machines are very welcome.
 
-**External displays (HDMI / USB-C):** untested. The driver lights every connected output with the same image, so at
-best an external screen **mirrors** the built-in panel. An extended desktop on a second screen is not supported yet.
+**External displays:** HDMI works if the monitor is plugged in when the Mac boots (tested): the driver lights every
+connected output with the same image as the built-in panel. Plugging a monitor in after boot doesn't bring it up, there is
+no extended desktop yet, and there is no HDMI audio. USB-C / DisplayPort outputs are untested.
 
 ## Install
 

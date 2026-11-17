@@ -58,7 +58,10 @@ Safari's sandbox; not done.
 ### Others
 - **Minecraft 1.12.2 on Zink:** ~30 fps, limited by presentation copies.
 - **Panther Lake / FD81:** IDs are in the driver (0108/0109) but never run on hardware.
-- **HDMI / USB-C displays:** untested; one image is mirrored to every output at best. Hot-plug does not take the flip lock.
+- **HDMI:** works when the monitor is connected at boot (tested by the user); the one scan-out image is mirrored to every
+  output. Hot-plug after boot does not bring the monitor up (`bridge_hotplug` in `nmx_fb_bridge.c` re-commits outside the
+  flip lock and limits modes to the panel size: the place to start). No HDMI audio: the Intel HDMI codec sits on the
+  HD Audio link, and the NMXAudio attempt (0110/0111) was removed. USB-C / DisplayPort untested.
 - **IOVersatile boot messages:** an Apple Silicon kext failing to load on x86; harmless, unrelated.
 
 ## Lessons
