@@ -51,6 +51,64 @@ problems. The installer warns you, and reports from these machines are very welc
 connected output with the same image as the built-in panel. Plugging a monitor in after boot doesn't bring it up, there is
 no extended desktop yet, and there is no HDMI audio. USB-C / DisplayPort outputs are untested.
 
+## How it works
+
+```mermaid
+flowchart TB
+    subgraph apps["Apps (user space)"]
+        A1["Metal apps<br/>Maps, Chrome, System Settings"]
+        A2["Vulkan apps<br/>Minecraft 26.3+"]
+        A3["OpenGL apps<br/>Minecraft 1.12.2"]
+        WS["WindowServer<br/>draws the desktop"]
+    end
+
+    subgraph bundles["/Library/GPUBundles"]
+        ZINK["NVKZinkGLDriver + Mesa Zink<br/>OpenGL → Vulkan"]
+        MTL["NVMTLDriver<br/>Metal → Vulkan<br/>(shaders: AIR → SPIR-V)"]
+        ANV["Mesa ANV<br/>Intel Vulkan driver"]
+        DRM["libdrm<br/>GPU commands and memory"]
+    end
+
+    subgraph kernel["/Library/Extensions (kernel)"]
+        ACC["MeowXE3Accel<br/>IOAccelerator: Metal device,<br/>GPU compositing"]
+        AGDC["MeowXE3AGDC<br/>display control"]
+        KEXT["MeowXE3.kext<br/>Linux xe GPU driver + i915 display code<br/>on FreeBSD LinuxKPI, on xnu"]
+        FW["GuC / HuC / DMC firmware"]
+    end
+
+    HW[("Intel Xe3 iGPU<br/>8086:FD80")]
+    PANEL[["Built-in panel / HDMI"]]
+
+    subgraph boot["OpenCore (boot)"]
+        OC["boot-arg nmxintel=1<br/>NVRAM nullmoth-fbflags=1833<br/>MeowXE3Boot.kext"]
+    end
+
+    A1 --> MTL
+    WS --> MTL
+    WS --> ACC
+    A3 --> ZINK --> ANV
+    A2 --> ANV
+    MTL --> ANV
+    ANV --> DRM --> KEXT
+    ACC --> KEXT
+    AGDC --> KEXT
+    FW -. loaded at start .-> KEXT
+    KEXT --> HW --> PANEL
+    OC -. turns on .-> KEXT
+```
+
+- **Apps** use Metal, Vulkan or OpenGL as on any Mac.
+- **Metal** calls go to `NVMTLDriver`, which turns them into Vulkan calls. Shaders are translated from Apple's AIR to
+  SPIR-V.
+- **OpenGL** goes through Mesa's Zink, which also runs on Vulkan.
+- **Vulkan** calls land in Mesa's Intel driver (ANV), which talks to the kernel through `libdrm`.
+- **In the kernel,** `MeowXE3.kext` is Linux's `xe` GPU driver and Intel's display code. They run on FreeBSD's Linux
+  compatibility layer, ported to the macOS kernel (NullMoth's NMXGPU). It loads the GPU firmware, runs the GPU and
+  drives the panel.
+- **`MeowXE3Accel`** is the accelerator macOS looks for. It gives apps a Metal device and lets WindowServer composite
+  the desktop on the GPU and flip finished frames onto the screen.
+- **OpenCore** turns the driver on at boot (`nmxintel=1`) and picks the display mode (`nullmoth-fbflags`).
+
 ## Install
 
 1. Download `MeowXE3-<version>.zip` from [Releases](../../releases) and unzip it.
