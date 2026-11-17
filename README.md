@@ -21,7 +21,7 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
 | Metal | apps, System Information shows Metal, Maps, Chromium WebGL |
 | Vulkan | native Intel Vulkan driver for apps (Minecraft 26.3+ at 60 fps) |
 | OpenGL | through Mesa Zink on the Vulkan driver (Minecraft 1.12.2 and other GL apps) |
-| Display | built-in panel, brightness slider |
+| Display | built-in panel, brightness slider (brightness keys on the X1504MA: [guide](docs/X1504MA-brightness-keys.md)) |
 
 Not yet: sleep (disabled), audio, Safari WebGL/YouTube (Safari's sandbox blocks the driver).
 
@@ -103,6 +103,7 @@ Every app is allowed by default (`*` in `/Library/GPUBundles/nvmtl-allow.txt`). 
 | `tools/tests/` | Metal regression tests (compute, render, mipmapped buffer textures) |
 | `tools/com.meowxe3.java-vulkan.plist` | optional LaunchAgent: every Java program uses MeowXE3's Vulkan driver |
 | `src/MeowXE3Boot/` | the small OpenCore-injected kext |
+| `docs/` | optional guides (X1504MA brightness keys) |
 
 The binaries (about 340 MB, including LLVM) are in the release zip, not in git.
 
