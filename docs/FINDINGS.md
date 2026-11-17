@@ -25,7 +25,9 @@ OpenCore, written down so the next person (or the next session) does not start f
 The firmware's S3 path fails in EFI (wake ends at code `0x1f`). With MeowXE3Boot the Mac reaches real sleep, but it
 does not come back. Sleep is turned off.
 
-### Camera (Photo Booth): black preview, intermittent kernel panic
+### Camera: works in browsers; Apple's apps show a black preview and Photo Booth can panic
+The camera and capture stack work: browsers show the camera (tested). The problem is how Apple's own apps draw the
+preview through Core Image on the Metal driver.
 - **Panic:** `thread_invoke: preemption_level -1 ... unlocking an unlocked mutex or spinlock`, in Photo Booth's process.
   Two of three runs with Metal panicked (after 6 min and after ~1 min). Reviewed and found balanced: the port's spin mutex
   (unused; Linux spinlocks map to sleeping `lck_mtx`), the callout and malloc spin locks, `nmx_critical_*` (interrupts

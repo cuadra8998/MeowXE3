@@ -32,14 +32,14 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
 | Panther Lake, Wildcat Lake `FD81` | ⚠️ Untested | in the driver, never run on real hardware |
 | Sleep | ❌ Doesn't work | the firmware's sleep fails; sleep is turned off |
 | Internal speakers / headphone jack | ❌ Doesn't work | the Realtek codec is on SoundWire, which needs Intel's DSP firmware. USB or Bluetooth audio should work instead (untested) |
-| Camera (Photo Booth, FaceTime, ...) | ❌ Doesn't work | black preview, and it can cause a kernel panic: **avoid** |
+| Camera | ⚠️ Partly | the camera itself works: browsers (Chrome, web video calls) show it. Apple's own apps (Photo Booth, FaceTime) show a **black preview**, a drawing problem in the Metal driver, not the camera |
 | Safari WebGL / YouTube | ❌ Doesn't work | Safari's sandbox blocks the driver; YouTube also needs an audio output (USB or Bluetooth, untested) |
 
 Details and what has been tried: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 > [!CAUTION]
-> **Camera apps (Photo Booth, FaceTime, ...):** the preview is black, and leaving one running for a few minutes has
-> caused a kernel panic. Avoid the camera until this is fixed.
+> **Photo Booth / FaceTime:** besides the black preview, leaving Photo Booth open for a few minutes has caused a kernel
+> panic. Use the camera from a browser for now, and avoid Apple's camera apps until this is fixed.
 
 **Tested on:** ASUS Vivobook X1504MA, Intel Wildcat Lake `8086:FD80`, macOS Tahoe 26.7, OpenCore 1.0.8.
 
