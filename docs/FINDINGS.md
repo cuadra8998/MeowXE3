@@ -56,7 +56,6 @@ Safari's WebContent sandbox blocks the Metal driver bundle. NullMoth's NVWebKitF
 Safari's sandbox; not done.
 
 ### Others
-- **Shutdown stalls:** macOS logs `shutdown_stall` reports; not investigated.
 - **Minecraft 1.12.2 on Zink:** ~30 fps, limited by presentation copies.
 - **Panther Lake / FD81:** IDs are in the driver (0108/0109) but never run on hardware.
 - **HDMI / USB-C displays:** untested; one image is mirrored to every output at best. Hot-plug does not take the flip lock.
