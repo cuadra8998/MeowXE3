@@ -1,0 +1,158 @@
+Subject: [PATCH 0076] drm-kmod: checkpoints in the display interrupt handlers (applied to drm-kmod, after 0064)
+
+nmx_trace before each statement-level call in gen11_display_irq_handler, gen8_de_irq_handler and
+intel_hpd_irq_handler, never inside a spin-locked region. Off unless the boot argument nmxtrace is set.
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -3,6 +3,7 @@
+  * Copyright © 2023 Intel Corporation
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <drm/drm_vblank.h>
+ 
+ #include "gt/intel_rps.h"
+@@ -1069,9 +1070,12 @@
+ 	drm_WARN_ON_ONCE(&dev_priv->drm, !HAS_DISPLAY(dev_priv));
+ 
+ 	if (master_ctl & GEN8_DE_MISC_IRQ) {
++		nmx_trace("gen8_de_irq_handler: intel_uncore_read", 0);
+ 		iir = intel_uncore_read(&dev_priv->uncore, GEN8_DE_MISC_IIR);
+ 		if (iir) {
++			nmx_trace("gen8_de_irq_handler: intel_uncore_write", 0);
+ 			intel_uncore_write(&dev_priv->uncore, GEN8_DE_MISC_IIR, iir);
++			nmx_trace("gen8_de_irq_handler: gen8_de_misc_irq_handler", 0);
+ 			gen8_de_misc_irq_handler(dev_priv, iir);
+ 		} else {
+ 			drm_err_ratelimited(&dev_priv->drm,
+@@ -1080,9 +1084,12 @@
+ 	}
+ 
+ 	if (DISPLAY_VER(dev_priv) >= 11 && (master_ctl & GEN11_DE_HPD_IRQ)) {
++		nmx_trace("gen8_de_irq_handler: intel_uncore_read", 0);
+ 		iir = intel_uncore_read(&dev_priv->uncore, GEN11_DE_HPD_IIR);
+ 		if (iir) {
++			nmx_trace("gen8_de_irq_handler: intel_uncore_write", 0);
+ 			intel_uncore_write(&dev_priv->uncore, GEN11_DE_HPD_IIR, iir);
++			nmx_trace("gen8_de_irq_handler: gen11_hpd_irq_handler", 0);
+ 			gen11_hpd_irq_handler(dev_priv, iir);
+ 		} else {
+ 			drm_err_ratelimited(&dev_priv->drm,
+@@ -1091,13 +1098,16 @@
+ 	}
+ 
+ 	if (master_ctl & GEN8_DE_PORT_IRQ) {
++		nmx_trace("gen8_de_irq_handler: intel_uncore_read", 0);
+ 		iir = intel_uncore_read(&dev_priv->uncore, GEN8_DE_PORT_IIR);
+ 		if (iir) {
+ 			bool found = false;
+ 
++			nmx_trace("gen8_de_irq_handler: intel_uncore_write", 0);
+ 			intel_uncore_write(&dev_priv->uncore, GEN8_DE_PORT_IIR, iir);
+ 
+ 			if (iir & gen8_de_port_aux_mask(dev_priv)) {
++				nmx_trace("gen8_de_irq_handler: intel_dp_aux_irq_handler", 0);
+ 				intel_dp_aux_irq_handler(display);
+ 				found = true;
+ 			}
+@@ -1106,6 +1116,7 @@
+ 				u32 hotplug_trigger = iir & BXT_DE_PORT_HOTPLUG_MASK;
+ 
+ 				if (hotplug_trigger) {
++					nmx_trace("gen8_de_irq_handler: bxt_hpd_irq_handler", 0);
+ 					bxt_hpd_irq_handler(dev_priv, hotplug_trigger);
+ 					found = true;
+ 				}
+@@ -1113,6 +1124,7 @@
+ 				u32 hotplug_trigger = iir & BDW_DE_PORT_HOTPLUG_MASK;
+ 
+ 				if (hotplug_trigger) {
++					nmx_trace("gen8_de_irq_handler: ilk_hpd_irq_handler", 0);
+ 					ilk_hpd_irq_handler(dev_priv, hotplug_trigger);
+ 					found = true;
+ 				}
+@@ -1120,6 +1132,7 @@
+ 
+ 			if ((IS_GEMINILAKE(dev_priv) || IS_BROXTON(dev_priv)) &&
+ 			    (iir & BXT_DE_PORT_GMBUS)) {
++				nmx_trace("gen8_de_irq_handler: intel_gmbus_irq_handler", 0);
+ 				intel_gmbus_irq_handler(display);
+ 				found = true;
+ 			}
+@@ -1128,6 +1141,7 @@
+ 				u32 te_trigger = iir & (DSI0_TE | DSI1_TE);
+ 
+ 				if (te_trigger) {
++					nmx_trace("gen8_de_irq_handler: gen11_dsi_te_interrupt_handler", 0);
+ 					gen11_dsi_te_interrupt_handler(dev_priv, te_trigger);
+ 					found = true;
+ 				}
+@@ -1148,6 +1162,7 @@
+ 		if (!(master_ctl & GEN8_DE_PIPE_IRQ(pipe)))
+ 			continue;
+ 
++		nmx_trace("gen8_de_irq_handler: intel_uncore_read", 0);
+ 		iir = intel_uncore_read(&dev_priv->uncore, GEN8_DE_PIPE_IIR(pipe));
+ 		if (!iir) {
+ 			drm_err_ratelimited(&dev_priv->drm,
+@@ -1155,6 +1170,7 @@
+ 			continue;
+ 		}
+ 
++		nmx_trace("gen8_de_irq_handler: intel_uncore_write", 0);
+ 		intel_uncore_write(&dev_priv->uncore, GEN8_DE_PIPE_IIR(pipe), iir);
+ 
+ 		if (iir & GEN8_PIPE_VBLANK)
+@@ -1197,6 +1213,7 @@
+ 		 * scheme also closed the SDE interrupt handling race we've seen
+ 		 * on older pch-split platforms. But this needs testing.
+ 		 */
++		nmx_trace("gen8_de_irq_handler: gen8_read_and_ack_pch_irqs", 0);
+ 		gen8_read_and_ack_pch_irqs(dev_priv, &iir, &pica_iir);
+ 		if (iir) {
+ 			if (pica_iir)
+@@ -1245,17 +1262,23 @@
+ {
+ 	u32 disp_ctl;
+ 
++	nmx_trace("gen11_display_irq_handler: disable_rpm_wakeref_asserts", 0);
+ 	disable_rpm_wakeref_asserts(&i915->runtime_pm);
+ 	/*
+ 	 * GEN11_DISPLAY_INT_CTL has same format as GEN8_MASTER_IRQ
+ 	 * for the display related bits.
+ 	 */
++	nmx_trace("gen11_display_irq_handler: intel_de_read", 0);
+ 	disp_ctl = intel_de_read(i915, GEN11_DISPLAY_INT_CTL);
+ 
++	nmx_trace("gen11_display_irq_handler: intel_de_write", 0);
+ 	intel_de_write(i915, GEN11_DISPLAY_INT_CTL, 0);
++	nmx_trace("gen11_display_irq_handler: gen8_de_irq_handler", 0);
+ 	gen8_de_irq_handler(i915, disp_ctl);
++	nmx_trace("gen11_display_irq_handler: intel_de_write", 0);
+ 	intel_de_write(i915, GEN11_DISPLAY_INT_CTL, GEN11_DISPLAY_IRQ_ENABLE);
+ 
++	nmx_trace("gen11_display_irq_handler: enable_rpm_wakeref_asserts", 0);
+ 	enable_rpm_wakeref_asserts(&i915->runtime_pm);
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_hotplug.c b/drivers/gpu/drm/i915/display/intel_hotplug.c
+--- a/drivers/gpu/drm/i915/display/intel_hotplug.c
++++ b/drivers/gpu/drm/i915/display/intel_hotplug.c
+@@ -21,6 +21,7 @@
+  * IN THE SOFTWARE.
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/debugfs.h>
+ #include <linux/kernel.h>
+ 
+@@ -548,6 +549,7 @@
+ 	if (!pin_mask)
+ 		return;
+ 
++	nmx_trace("intel_hpd_irq_handler: spin_lock", 0);
+ 	spin_lock(&dev_priv->irq_lock);
+ 
+ 	/*

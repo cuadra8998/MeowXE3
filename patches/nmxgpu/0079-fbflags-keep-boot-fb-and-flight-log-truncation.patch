@@ -1,0 +1,72 @@
+Subject: [PATCH 0079] nullmoth-fbflags 0x8 keeps the boot framebuffer; retirement breadcrumbs; flight log emptied
+
+Wildcat Lake test start 21 (0077: no registration re-commit): the publish ran straight through - modeset, register,
+IOFramebuffer start in under half a second - and the Mac died ~0.1 s after the last breadcrumb, "publish: retiring
+the boot framebuffer" (heartbeat stopped at t=2). The flight log still ended with the previous start's lines:
+O_TRUNC had not emptied it.
+
+- xnu/nmx_fb.cpp: nullmoth-fbflags bit 0x8 keeps IONDRVFramebuffer (as -nmxkeepndrv); "publish: retire:" breadcrumbs
+  for the number found and before/after each terminate().
+- xnu/nmx_flight.cpp: the file's size is set to 0 with vnode_setattr after opening it.
+
+Applies on top of 0051-0077.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -24,9 +24,10 @@
+ /*
+  * Bring-up bisection of the freeze that follows IOFramebuffer::start on Wildcat Lake (the display itself runs fine:
+  * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
+- * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer.
++ * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer,
++ * 0x8 = keep the firmware's boot framebuffer (as -nmxkeepndrv).
+  */
+-enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4 };
++enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -260,6 +261,11 @@
+     int dummy = 0;
+     if (PE_parse_boot_argn("-nmxkeepndrv", &dummy, sizeof(dummy)))
+         return;
++    if (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbKeepBootFb) {
++        FBLOG("nullmoth-fbflags 0x8: keeping the boot framebuffer");
++        nmx_trace("publish: retire: kept (nullmoth-fbflags 0x8)", 0);
++        return;
++    }
+     IOService *pci = gpu->getProvider();
+     if (pci == nullptr)
+         return;
+@@ -276,10 +282,13 @@
+             victims->setObject(f);
+     }
+     it->release();
++    nmx_trace("publish: retire: boot framebuffers found", (long)victims->getCount());
+     for (unsigned i = 0; i < victims->getCount(); i++) {
+         IOService *f = (IOService *)victims->getObject(i);
+         FBLOG("retiring the boot framebuffer %s", f->getMetaClass()->getClassName());
++        nmx_trace("publish: retire: terminate requested", (long)i);
+         f->terminate();
++        nmx_trace("publish: retire: terminate returned", (long)i);
+     }
+     victims->release();
+ }
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+--- a/gpu-port/xkpi/xnu/nmx_flight.cpp
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -343,6 +343,13 @@
+         IOLog("NullMoth flight recorder: cannot open %s (%d)\n", kFlightPath, err);
+         return;
+     }
++    /* O_TRUNC alone left the previous start's tail in place (seen on Wildcat Lake): set the size to 0 explicitly */
++    struct vnode_attr va;
++    VATTR_INIT(&va);
++    VATTR_SET(&va, va_data_size, 0);
++    err = vnode_setattr(gVp, &va, gCtx);
++    if (err)
++        IOLog("NullMoth flight recorder: could not empty %s (%d)\n", kFlightPath, err);
+     thread_t t;
+     if (kernel_thread_start(flight_writer, nullptr, &t) != KERN_SUCCESS) {
+         IOLog("NullMoth flight recorder: no writer thread\n");

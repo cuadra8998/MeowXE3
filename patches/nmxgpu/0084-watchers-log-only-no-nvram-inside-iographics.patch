@@ -1,0 +1,65 @@
+Subject: [PATCH 0084] power/event watchers: flight log only, no NVRAM breadcrumb or synced write in the callbacks
+
+Wildcat Lake test 26: the Mac ran on for ~85 s with NMXGPU's pipe lit, then hung during a display mode change of the
+boot framebuffer (IOGraphics events 80, 1, 81 with no completion), each event written to NVRAM and synced to disk from
+inside IOGraphics' notification. The watchers now trace as "watch:", which nmx_trace keeps out of NVRAM and the synced
+flush (the 40 ms flight writer still records them), so the diagnostics cannot block IOGraphics themselves.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 6bda04f..cbee25a 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -77,7 +77,8 @@ OSDefineMetaClassAndStructors(NMXGPU, IOService)
+  * GPU, NMXGPU's framebuffer registering its power driver froze the Mac within milliseconds, and retiring the boot
+  * framebuffer froze it too. These watch, right before the publish, every power change of the GPU's PCI device and of the
+  * boot framebuffer, IOGraphics' events for the boot framebuffer and IOKit messages to both, each with the PCI command
+- * register and D-state, as "attach:" breadcrumbs (NVRAM and the synced flight log).
++ * register and D-state, as "watch:" lines in the flight log only: no NVRAM breadcrumb or synced write, which would block
++ * inside IOGraphics' callbacks (test 26 hung during a mode change of the boot framebuffer after such writes).
+  */
+ void NMXGPU::logPciState(const char *why)
+ {
+@@ -86,14 +87,14 @@ void NMXGPU::logPciState(const char *why)
+     char b[120];
+     UInt16 cmd = pci_->configRead16(kIOPCIConfigCommand);
+     int dstate = pmCap_ ? (pci_->configRead16(pmCap_ + 4) & 3) : -1;
+-    snprintf(b, sizeof(b), "attach: pci %s: command 0x%04x, D-state", why, cmd);
++    snprintf(b, sizeof(b), "watch: pci %s: command 0x%04x, D-state", why, cmd);
+     nmx_trace(b, dstate);
+ }
+ 
+ IOReturn NMXGPU::powerStateWillChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *dev)
+ {
+     char b[120];
+-    snprintf(b, sizeof(b), "attach: pm %s (%s) will change to state", dev ? dev->getName() : "?",
++    snprintf(b, sizeof(b), "watch: pm %s (%s) will change to state", dev ? dev->getName() : "?",
+              dev ? dev->getMetaClass()->getClassName() : "?");
+     nmx_trace(b, (long)state);
+     logPciState("pm will");
+@@ -103,7 +104,7 @@ IOReturn NMXGPU::powerStateWillChangeTo(IOPMPowerFlags caps, unsigned long state
+ IOReturn NMXGPU::powerStateDidChangeTo(IOPMPowerFlags caps, unsigned long state, IOService *dev)
+ {
+     char b[120];
+-    snprintf(b, sizeof(b), "attach: pm %s (%s) did change to state", dev ? dev->getName() : "?",
++    snprintf(b, sizeof(b), "watch: pm %s (%s) did change to state", dev ? dev->getName() : "?",
+              dev ? dev->getMetaClass()->getClassName() : "?");
+     nmx_trace(b, (long)state);
+     logPciState("pm did");
+@@ -113,7 +114,7 @@ IOReturn NMXGPU::powerStateDidChangeTo(IOPMPowerFlags caps, unsigned long state,
+ IOReturn NMXGPU::fbNotify(OSObject *obj, void *, IOFramebuffer *fb, IOIndex event, void *)
+ {
+     char b[120];
+-    snprintf(b, sizeof(b), "attach: fb event from %s (%s)", fb ? fb->getName() : "?",
++    snprintf(b, sizeof(b), "watch: fb event from %s (%s)", fb ? fb->getName() : "?",
+              fb ? fb->getMetaClass()->getClassName() : "?");
+     nmx_trace(b, (long)event);
+     NMXGPU *me = OSDynamicCast(NMXGPU, obj);
+@@ -125,7 +126,7 @@ IOReturn NMXGPU::fbNotify(OSObject *obj, void *, IOFramebuffer *fb, IOIndex even
+ IOReturn NMXGPU::ioMessage(void *target, void *, UInt32 type, IOService *provider, void *, vm_size_t)
+ {
+     char b[120];
+-    snprintf(b, sizeof(b), "attach: message to %s (%s) 0x%08x", provider ? provider->getName() : "?",
++    snprintf(b, sizeof(b), "watch: message to %s (%s) 0x%08x", provider ? provider->getName() : "?",
+              provider ? provider->getMetaClass()->getClassName() : "?", type);
+     nmx_trace(b, (long)type);
+     return kIOReturnSuccess;

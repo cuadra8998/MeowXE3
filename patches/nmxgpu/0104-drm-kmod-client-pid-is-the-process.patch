@@ -1,0 +1,41 @@
+diff --git a/drivers/gpu/drm/drm_file.c b/drivers/gpu/drm/drm_file.c
+index 6d25949..4abfb4c 100644
+--- a/drivers/gpu/drm/drm_file.c
++++ b/drivers/gpu/drm/drm_file.c
+@@ -144,7 +144,8 @@ struct drm_file *drm_file_alloc(struct drm_minor *minor)
+ 	rcu_assign_pointer(file->pid, get_pid(task_tgid(current)));
+ #elif defined(__FreeBSD__)
+ 	// BSDFIXME: No task_tgid() support.
+-	file->pid = get_pid(task_pid(current));
++	/* NullMoth/MeowXE3: the process, as Linux (task_tgid); task_pid is the opening thread in this port */
++	file->pid = get_pid(task_pid_group_leader(current));
+ #endif
+ 	file->minor = minor;
+ 
+@@ -472,8 +473,9 @@ void drm_file_update_pid(struct drm_file *filp)
+ #ifdef __linux__
+ 	pid = task_tgid(current);
+ #elif defined(__FreeBSD__)
+-	// BSDFIXME: No task_tgid() support.
+-	pid = task_pid(current);
++	/* NullMoth/MeowXE3: the process (task_pid_group_leader = td_proc->p_pid), as Linux's task_tgid; task_pid is the
++	 * calling thread here, so every ioctl from another thread relabelled the client with a thread id */
++	pid = task_pid_group_leader(current);
+ #endif
+ 
+ 	/*
+@@ -498,7 +500,14 @@ void drm_file_update_pid(struct drm_file *filp)
+ #endif
+ 	mutex_unlock(&dev->filelist_mutex);
+ 
++	/*
++	 * FreeBSD: the pid is a plain integer (and task_pid() is the thread id,
++	 * so this runs for every new calling thread): no reader can hold the old
++	 * one, so there is no grace period to wait for.
++	 */
++#ifdef __linux__
+ 	synchronize_rcu();
++#endif
+ 	put_pid(old);
+ }
+ 

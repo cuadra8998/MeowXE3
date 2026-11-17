@@ -1,0 +1,39 @@
+Subject: [PATCH 0072] NMXGPU asks to stay on (changePowerStateTo(1)) so a framebuffer joining the PM tree cannot suspend xe
+
+Wildcat Lake test starts 11-16: the whole Mac froze within moments of NMXGPU's IOFramebuffer starting, with the last
+breadcrumb around registerPowerDriver / start: done / registerService; with no framebuffer (nullmoth-fbstop=1) the
+same start ran on for minutes, and neither the console role nor the vblank timer mattered (nullmoth-fbflags=3).
+NMXGPU registered two power states but never declared a desire of its own, so its state followed its power children:
+the framebuffer joins the tree as one, at state 0, and power management took NMXGPU to 0 as well -> setPowerState(0)
+-> nmx_port_power(off) -> xe suspended under a running display (and the PCI device can follow into D3).
+
+- xnu/nmx_kext.cpp: changePowerStateTo(1) right after registerPowerDriver; system sleep still powers it down through
+  the usual path. Every NMXGPU::setPowerState is noted as an "attach:" breadcrumb (nmxtrace).
+
+Applies on top of 0051-0071.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -317,6 +317,13 @@
+     PMinit();
+     pci_->joinPMtree(this);
+     registerPowerDriver(this, states, 2);
++    /*
++     * Stay on unless the system sleeps. Without a desire of its own the GPU's power state follows its power children:
++     * the framebuffer published below joins the tree as one, at state 0, and power management then took this driver
++     * to 0 too - suspending xe under a running display (Wildcat Lake: the whole Mac froze right after
++     * IOFramebuffer::start, while the same start without a framebuffer ran on; nullmoth-fbstop=1, test 15).
++     */
++    changePowerStateTo(1);
+     pm_ = true;
+     registerService();
+     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
+@@ -382,6 +389,7 @@
+      * started paused (its jobs never reached the GuC). Only a power-on after a suspend this driver did is a resume.
+      */
+     bool on = state != 0;
++    nmx_trace("attach: NMXGPU setPowerState (state)", (long)state);
+     if (dev_ != nullptr && on == suspended_) {
+         int err = nmx_port_power(dev_, on);
+         if (err)

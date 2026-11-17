@@ -1,0 +1,311 @@
+Subject: [PATCH 0060] drm-kmod: checkpoints in the display driver's probe (applied to drm-kmod, after 0052)
+
+nmx_trace("<function>: <call>") before each statement-level call in intel_display_driver_probe_noirq,
+intel_display_driver_probe_nogem, intel_display_driver_probe and intel_modeset_setup_hw_state (readout and sanitize of
+what the firmware left on). nmx_trace is NMXGPU's (bsdcompat/src/nmx_trace.c, 0055/0058): off unless the boot
+argument nmxtrace is set; nmxtrace=3 also keeps the last step in NVRAM (nullmoth-gpu-trace).
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display_driver.c b/drivers/gpu/drm/i915/display/intel_display_driver.c
+--- a/drivers/gpu/drm/i915/display/intel_display_driver.c
++++ b/drivers/gpu/drm/i915/display/intel_display_driver.c
+@@ -7,6 +7,7 @@
+  * details here.
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/vga_switcheroo.h>
+ #include <acpi/video.h>
+ #include <drm/display/drm_dp_mst_helper.h>
+@@ -214,30 +215,37 @@
+ 		return -ENODEV;
+ 
+ 	if (HAS_DISPLAY(display)) {
++		nmx_trace("intel_display_driver_probe_noirq: drm_vblank_init", 0);
+ 		ret = drm_vblank_init(display->drm,
+ 				      INTEL_NUM_PIPES(display));
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_bios_init", 0);
+ 	intel_bios_init(display);
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_vga_register", 0);
+ 	ret = intel_vga_register(display);
+ 	if (ret)
+ 		goto cleanup_bios;
+ 
+ 	/* FIXME: completely on the wrong abstraction layer */
++	nmx_trace("intel_display_driver_probe_noirq: intel_power_domains_init", 0);
+ 	ret = intel_power_domains_init(display);
+ 	if (ret < 0)
+ 		goto cleanup_vga;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_pmdemand_init_early", 0);
+ 	intel_pmdemand_init_early(display);
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_power_domains_init_hw", 0);
+ 	intel_power_domains_init_hw(display, false);
+ 
+ 	if (!HAS_DISPLAY(display))
+ 		return 0;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_dmc_init", 0);
+ 	intel_dmc_init(display);
+ 
+ 	display->wq.modeset = alloc_ordered_workqueue("i915_modeset", 0);
+@@ -249,40 +257,52 @@
+ #endif
+ 	display->wq.cleanup = alloc_workqueue("i915_cleanup", WQ_HIGHPRI, 0);
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_mode_config_init", 0);
+ 	intel_mode_config_init(display);
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_cdclk_init", 0);
+ 	ret = intel_cdclk_init(display);
+ 	if (ret)
+ 		goto cleanup_vga_client_pw_domain_dmc;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_color_init", 0);
+ 	ret = intel_color_init(display);
+ 	if (ret)
+ 		goto cleanup_vga_client_pw_domain_dmc;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_dbuf_init", 0);
+ 	ret = intel_dbuf_init(i915);
+ 	if (ret)
+ 		goto cleanup_vga_client_pw_domain_dmc;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_bw_init", 0);
+ 	ret = intel_bw_init(i915);
+ 	if (ret)
+ 		goto cleanup_vga_client_pw_domain_dmc;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_pmdemand_init", 0);
+ 	ret = intel_pmdemand_init(display);
+ 	if (ret)
+ 		goto cleanup_vga_client_pw_domain_dmc;
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_init_quirks", 0);
+ 	intel_init_quirks(display);
+ 
++	nmx_trace("intel_display_driver_probe_noirq: intel_fbc_init", 0);
+ 	intel_fbc_init(display);
+ 
+ 	return 0;
+ 
+ cleanup_vga_client_pw_domain_dmc:
++	nmx_trace("intel_display_driver_probe_noirq: intel_dmc_fini", 0);
+ 	intel_dmc_fini(display);
++	nmx_trace("intel_display_driver_probe_noirq: intel_power_domains_driver_remove", 0);
+ 	intel_power_domains_driver_remove(display);
+ cleanup_vga:
++	nmx_trace("intel_display_driver_probe_noirq: intel_vga_unregister", 0);
+ 	intel_vga_unregister(display);
+ cleanup_bios:
++	nmx_trace("intel_display_driver_probe_noirq: intel_bios_driver_remove", 0);
+ 	intel_bios_driver_remove(display);
+ 
+ 	return ret;
+@@ -433,12 +453,16 @@
+ 	if (!HAS_DISPLAY(display))
+ 		return 0;
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_wm_init", 0);
+ 	intel_wm_init(i915);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_panel_sanitize_ssc", 0);
+ 	intel_panel_sanitize_ssc(i915);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_pps_setup", 0);
+ 	intel_pps_setup(display);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_gmbus_setup", 0);
+ 	intel_gmbus_setup(display);
+ 
+ 	drm_dbg_kms(display->drm, "%d display pipe%s available.\n",
+@@ -446,39 +470,56 @@
+ 		    INTEL_NUM_PIPES(display) > 1 ? "s" : "");
+ 
+ 	for_each_pipe(display, pipe) {
++		nmx_trace("intel_display_driver_probe_nogem: intel_crtc_init", 0);
+ 		ret = intel_crtc_init(i915, pipe);
+ 		if (ret)
+ 			goto err_mode_config;
+ 	}
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_plane_possible_crtcs_init", 0);
+ 	intel_plane_possible_crtcs_init(display);
++	nmx_trace("intel_display_driver_probe_nogem: intel_shared_dpll_init", 0);
+ 	intel_shared_dpll_init(i915);
++	nmx_trace("intel_display_driver_probe_nogem: intel_fdi_pll_freq_update", 0);
+ 	intel_fdi_pll_freq_update(i915);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_update_czclk", 0);
+ 	intel_update_czclk(i915);
++	nmx_trace("intel_display_driver_probe_nogem: intel_display_driver_init_hw", 0);
+ 	intel_display_driver_init_hw(display);
++	nmx_trace("intel_display_driver_probe_nogem: intel_dpll_update_ref_clks", 0);
+ 	intel_dpll_update_ref_clks(i915);
+ 
+ 	if (display->cdclk.max_cdclk_freq == 0)
+ 		intel_update_max_cdclk(display);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_hti_init", 0);
+ 	intel_hti_init(display);
+ 
+ 	/* Just disable it once at startup */
++	nmx_trace("intel_display_driver_probe_nogem: intel_vga_disable", 0);
+ 	intel_vga_disable(display);
++	nmx_trace("intel_display_driver_probe_nogem: intel_setup_outputs", 0);
+ 	intel_setup_outputs(i915);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_dp_tunnel_mgr_init", 0);
+ 	ret = intel_dp_tunnel_mgr_init(display);
+ 	if (ret)
+ 		goto err_hdcp;
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_display_driver_disable_user_access", 0);
+ 	intel_display_driver_disable_user_access(display);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: drm_modeset_lock_all", 0);
+ 	drm_modeset_lock_all(display->drm);
++	nmx_trace("intel_display_driver_probe_nogem: intel_modeset_setup_hw_state", 0);
+ 	intel_modeset_setup_hw_state(i915, display->drm->mode_config.acquire_ctx);
++	nmx_trace("intel_display_driver_probe_nogem: intel_acpi_assign_connector_fwnodes", 0);
+ 	intel_acpi_assign_connector_fwnodes(display);
++	nmx_trace("intel_display_driver_probe_nogem: drm_modeset_unlock_all", 0);
+ 	drm_modeset_unlock_all(display->drm);
+ 
++	nmx_trace("intel_display_driver_probe_nogem: intel_initial_plane_config", 0);
+ 	intel_initial_plane_config(display);
+ 
+ 	/*
+@@ -492,8 +533,10 @@
+ 	return 0;
+ 
+ err_hdcp:
++	nmx_trace("intel_display_driver_probe_nogem: intel_hdcp_component_fini", 0);
+ 	intel_hdcp_component_fini(display);
+ err_mode_config:
++	nmx_trace("intel_display_driver_probe_nogem: intel_mode_config_cleanup", 0);
+ 	intel_mode_config_cleanup(display);
+ 
+ 	return ret;
+@@ -513,6 +556,7 @@
+ 	 * the BIOS fb takeover and whatever else magic ggtt reservations
+ 	 * happen during gem/ggtt init.
+ 	 */
++	nmx_trace("intel_display_driver_probe: intel_hdcp_component_init", 0);
+ 	intel_hdcp_component_init(display);
+ 
+ 	/*
+@@ -521,15 +565,19 @@
+ 	 * are already calculated and there is no assert_plane warnings
+ 	 * during bootup.
+ 	 */
++	nmx_trace("intel_display_driver_probe: intel_initial_commit", 0);
+ 	ret = intel_initial_commit(display->drm);
+ 	if (ret)
+ 		drm_dbg_kms(display->drm, "Initial modeset failed, %d\n", ret);
+ 
++	nmx_trace("intel_display_driver_probe: intel_overlay_setup", 0);
+ 	intel_overlay_setup(display);
+ 
+ 	/* Only enable hotplug handling once the fbdev is fully set up. */
++	nmx_trace("intel_display_driver_probe: intel_hpd_init", 0);
+ 	intel_hpd_init(i915);
+ 
++	nmx_trace("intel_display_driver_probe: skl_watermark_ipc_init", 0);
+ 	skl_watermark_ipc_init(i915);
+ 
+ 	return 0;
+diff --git a/drivers/gpu/drm/i915/display/intel_modeset_setup.c b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+--- a/drivers/gpu/drm/i915/display/intel_modeset_setup.c
++++ b/drivers/gpu/drm/i915/display/intel_modeset_setup.c
+@@ -6,6 +6,7 @@
+  * state.
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <drm/drm_atomic_uapi.h>
+ #include <drm/drm_atomic_state_helper.h>
+ #include <drm/drm_vblank.h>
+@@ -968,14 +969,19 @@
+ 	struct intel_crtc *crtc;
+ 	intel_wakeref_t wakeref;
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_display_power_get", 0);
+ 	wakeref = intel_display_power_get(i915, POWER_DOMAIN_INIT);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_early_display_was", 0);
+ 	intel_early_display_was(i915);
++	nmx_trace("intel_modeset_setup_hw_state: intel_modeset_readout_hw_state", 0);
+ 	intel_modeset_readout_hw_state(i915);
+ 
+ 	/* HW state is read out, now we need to sanitize this mess. */
++	nmx_trace("intel_modeset_setup_hw_state: get_encoder_power_domains", 0);
+ 	get_encoder_power_domains(i915);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_pch_sanitize", 0);
+ 	intel_pch_sanitize(i915);
+ 
+ 	/*
+@@ -986,18 +992,24 @@
+ 		struct intel_crtc_state *crtc_state =
+ 			to_intel_crtc_state(crtc->base.state);
+ 
++		nmx_trace("intel_modeset_setup_hw_state: intel_sanitize_fifo_underrun_reporting", 0);
+ 		intel_sanitize_fifo_underrun_reporting(crtc_state);
+ 
++		nmx_trace("intel_modeset_setup_hw_state: drm_crtc_vblank_reset", 0);
+ 		drm_crtc_vblank_reset(&crtc->base);
+ 
+ 		if (crtc_state->hw.active) {
++			nmx_trace("intel_modeset_setup_hw_state: intel_dmc_enable_pipe", 0);
+ 			intel_dmc_enable_pipe(display, crtc->pipe);
++			nmx_trace("intel_modeset_setup_hw_state: intel_crtc_vblank_on", 0);
+ 			intel_crtc_vblank_on(crtc_state);
+ 		}
+ 	}
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_fbc_sanitize", 0);
+ 	intel_fbc_sanitize(&i915->display);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_sanitize_plane_mapping", 0);
+ 	intel_sanitize_plane_mapping(i915);
+ 
+ 	for_each_intel_encoder(&i915->drm, encoder)
+@@ -1007,12 +1019,16 @@
+ 	 * Sanitizing CRTCs needs their connector atomic state to be
+ 	 * up-to-date, so ensure that already here.
+ 	 */
++	nmx_trace("intel_modeset_setup_hw_state: intel_modeset_update_connector_atomic_state", 0);
+ 	intel_modeset_update_connector_atomic_state(i915);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_sanitize_all_crtcs", 0);
+ 	intel_sanitize_all_crtcs(i915, ctx);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_dpll_sanitize_state", 0);
+ 	intel_dpll_sanitize_state(i915);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_wm_get_hw_state", 0);
+ 	intel_wm_get_hw_state(i915);
+ 
+ 	for_each_intel_crtc(&i915->drm, crtc) {
+@@ -1020,12 +1036,15 @@
+ 			to_intel_crtc_state(crtc->base.state);
+ 		struct intel_power_domain_mask put_domains;
+ 
++		nmx_trace("intel_modeset_setup_hw_state: intel_modeset_get_crtc_power_domains", 0);
+ 		intel_modeset_get_crtc_power_domains(crtc_state, &put_domains);
+ 		if (drm_WARN_ON(&i915->drm, !bitmap_empty(put_domains.bits, POWER_DOMAIN_NUM)))
+ 			intel_modeset_put_crtc_power_domains(crtc, &put_domains);
+ 	}
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_display_power_put", 0);
+ 	intel_display_power_put(i915, POWER_DOMAIN_INIT, wakeref);
+ 
++	nmx_trace("intel_modeset_setup_hw_state: intel_power_domains_sanitize_state", 0);
+ 	intel_power_domains_sanitize_state(display);
+ }

@@ -1,0 +1,209 @@
+Subject: [PATCH 0088] display hold until the framebuffer is published; synchronous retire; preallocated flight log
+
+Following ericek111's NMXVGAFB (vibe-nullmoth-xe3-qemu, part 4):
+- xnu/nmx_kext.cpp: WindowServer starts before the Auxiliary KC loads, waits for a quiet registry and opens the
+  framebuffers there once. NMXGPU's attach ran on its own thread with start() already returned, so WindowServer
+  opened the firmware's boot framebuffer and never NMXGPU's (Wildcat Lake tests 26-31: black panel). The attach now
+  keeps NMXGPU busy (adjustBusy) from the firmware folder check until the framebuffer is published or the attach
+  gives up, 30 s at most (a cap timer).
+- xnu/nmx_fb.cpp: the boot framebuffer is retired with terminate(kIOServiceRequired | kIOServiceSynchronous), as
+  NMXVGAFB does; the wait for WindowServer to hold it (0086) and the AppleUpstreamUserClientDriver pre-stop (0087)
+  are gone (with the hold WindowServer never holds it first; the pre-stop likely caused test 33's panic), and so is
+  the PCI-wide waitQuiet after an early retire, which the hold below the same device would always run out.
+- xnu/nmx_flight.cpp: the flight log file is preallocated (8 MiB of zeros) so the per-step synced writes do not grow
+  it; tests 30 and 32 lost the last second written before the panic. Read it with  tr -d '\0'.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index cbee25a..001c2fa 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -53,6 +53,18 @@ class NMXGPU : public IOService {
+     bool suspended_;        /* the driver was told to suspend; only then does a power-on mean resume */
+     static void attachThread(void *arg, wait_result_t);
+     void attachNow();
++    /*
++     * Display hold (as ericek111's NMXVGAFB): WindowServer starts before the Auxiliary KC loads, waits for a quiet
++     * registry, then opens the framebuffers there once. The attach runs on its own thread and start() returned at
++     * once, so the registry went quiet with only the firmware's boot framebuffer, WindowServer opened that one and
++     * never NMXGPU's, published ~4 s later (Wildcat Lake tests 26-31: black panel, desktop on the retired buffer).
++     * The attach keeps this driver busy until the framebuffer is published (or the attach gives up), 30 s at most.
++     */
++    volatile int holding_ = 0;
++    thread_call_t holdCap_ = nullptr;
++    void holdDisplay();
++    void releaseDisplay(const char *why);
++    static void holdCapFire(thread_call_param_t p0, thread_call_param_t);
+     /* nmxtrace: what macOS does to this GPU and to the firmware's boot framebuffer around the publish */
+     UInt8 pmCap_ = 0;
+     void watchBootFramebuffer();
+@@ -390,11 +402,14 @@ void NMXGPU::attachNow()
+         attach_ = -1;
+         return;
+     }
++    /* after the firmware folder, so the hold never delays the mount it waits for */
++    holdDisplay();
+     if (nmx_marker_set()) {
+         IOLog("NullMoth GPU: the last attach of %04x:%04x never returned (the Mac stopped or restarted); this GPU stays "
+               "with macOS. Send logs, then turn the test driver off and on to try again\n",
+               pci_->configRead16(kIOPCIConfigVendorID), pci_->configRead16(kIOPCIConfigDeviceID));
+         setProperty("nullmoth-gpu-state", "parked: the last attach never returned");
++        releaseDisplay("parked by the boot guard");
+         attach_ = -1;
+         return;
+     }
+@@ -414,6 +429,7 @@ void NMXGPU::attachNow()
+         nmx_marker_write(false);
+         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
+               pci_->configRead16(kIOPCIConfigDeviceID));
++        releaseDisplay("no driver took the GPU");
+         attach_ = -1;
+         return;
+     }
+@@ -443,6 +459,7 @@ void NMXGPU::attachNow()
+     nmx_trace("attach: publishing the framebuffer", 0);
+     fb_ = nmx_fb_publish(this, dev_);
+     nmx_trace("attach: framebuffer published", fb_ != nullptr);
++    releaseDisplay(fb_ != nullptr ? "framebuffer published" : "no framebuffer");
+     nmx_marker_write(false);
+     IOLog("NullMoth GPU: driving %04x:%04x (build %s)\n", pci_->configRead16(kIOPCIConfigVendorID),
+           pci_->configRead16(kIOPCIConfigDeviceID), NMX_BUILD_STAMP);
+@@ -450,6 +467,44 @@ void NMXGPU::attachNow()
+     attach_ = 1;
+ }
+ 
++void NMXGPU::holdDisplay()
++{
++    holdCap_ = thread_call_allocate(&NMXGPU::holdCapFire, this);
++    if (holdCap_ == nullptr)
++        return;
++    retain();   /* for the cap timer */
++    if (OSCompareAndSwap(0, 1, &holding_))
++        adjustBusy(1);
++    uint64_t d;
++    clock_interval_to_deadline(30, kSecondScale, &d);
++    thread_call_enter_delayed(holdCap_, d);
++    nmx_trace("attach: display hold: registry busy until the framebuffer is published (30 s at most)", 0);
++}
++
++void NMXGPU::releaseDisplay(const char *why)
++{
++    if (OSCompareAndSwap(1, 0, &holding_)) {
++        adjustBusy(-1);
++        IOLog("NullMoth GPU: display hold released (%s)\n", why);
++        nmx_trace("attach: display hold released", 0);
++    }
++    if (holdCap_ != nullptr && thread_call_cancel(holdCap_)) {
++        thread_call_free(holdCap_);
++        holdCap_ = nullptr;
++        release();
++    }
++}
++
++void NMXGPU::holdCapFire(thread_call_param_t p0, thread_call_param_t)
++{
++    NMXGPU *self = (NMXGPU *)p0;
++    if (OSCompareAndSwap(1, 0, &self->holding_)) {
++        self->adjustBusy(-1);
++        IOLog("NullMoth GPU: display hold ran out (30 s); WindowServer goes on\n");
++    }
++    self->release();   /* the timer's reference; the call itself is freed by releaseDisplay or stays allocated */
++}
++
+ void NMXGPU::stop(IOService *provider)
+ {
+     nmx_xnu_diag_fini();
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index d2d1396..48ca335 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -340,52 +340,18 @@ static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early
+         uint64_t quiet_ns = 15000000000ULL;
+         nmx_trace("publish: retire: boot framebuffer quiet (ret)", (long)f->waitQuiet(quiet_ns));
+         /*
+-         * and until IOGraphics has opened it and WindowServer holds it (an IOFramebufferUserClient below it): test 28
+-         * retired at 15.5 s, after that open (14.3 s), without a panic; tests 29 and 30 retired earlier and panicked.
+-         * At most 30 s, then retired anyway.
++         * Synchronously and required, as ericek111's NMXVGAFB does (kIOServiceRequired | kIOServiceSynchronous): the
++         * boot framebuffer and its clients are stopped when this returns, before NMXGPU's framebuffer starts and,
++         * with the display hold (xnu/nmx_kext.cpp), before WindowServer has opened either.
+          */
+-        int waited = 0;
+-        for (; waited < 300; waited++) {
+-            bool held = false;
+-            OSIterator *ci = f->getClientIterator();
+-            if (ci != nullptr) {
+-                for (OSObject *c; (c = ci->getNextObject()) != nullptr; )
+-                    if (c->metaCast("IOFramebufferUserClient") != nullptr) { held = true; break; }
+-                ci->release();
+-            }
+-            if (held) break;
+-            IOSleep(100);
+-        }
+-        nmx_trace("publish: retire: waited for WindowServer on it (100 ms steps, 300 = gave up)", (long)waited);
+-        /*
+-         * Stop the boot framebuffer's AppleUpstreamUserClientDriver clients first, synchronously: their stop removes
+-         * their IOGraphics notification, and terminate's group notification to them panicked on NULL in
+-         * fbNotificationOccurred in tests 29, 30 and 32 (not 28 and 31) whatever the timing. They go with the
+-         * framebuffer's termination anyway.
+-         */
+-        OSArray *clients = OSArray::withCapacity(2);
+-        OSIterator *cl = clients ? f->getClientIterator() : nullptr;
+-        if (cl != nullptr) {
+-            for (OSObject *c; (c = cl->getNextObject()) != nullptr; )
+-                if (c->metaCast("AppleUpstreamUserClientDriver") != nullptr)
+-                    clients->setObject(c);
+-            cl->release();
+-        }
+-        nmx_trace("publish: retire: AppleUpstreamUserClient clients to stop", clients ? (long)clients->getCount() : -1L);
+-        for (unsigned k = 0; clients != nullptr && k < clients->getCount(); k++)
+-            nmx_trace("publish: retire: client terminated (ret)",
+-                      (long)((IOService *)clients->getObject(k))->terminate(kIOServiceSynchronous));
+-        OSSafeReleaseNULL(clients);
+         nmx_trace("publish: retire: terminate requested", (long)i);
+-        f->terminate();
+-        nmx_trace("publish: retire: terminate returned", (long)i);
++        bool done = f->terminate(kIOServiceRequired | kIOServiceSynchronous);
++        nmx_trace("publish: retire: terminate returned (done)", (long)done);
+     }
+     victims->release();
+-    if (early) {
+-        /* let the termination finish (IONDRVFramebuffer's stop) before the GPU is handed to the drivers */
+-        uint64_t ns = 3000000000ULL;
+-        nmx_trace("publish: retire: waiting for the PCI device to go quiet (ret)", (long)pci->waitQuiet(ns));
+-    }
++    /* the synchronous terminate has finished IONDRVFramebuffer's stop; no wait for the PCI device to go quiet, which
++       with NMXGPU's display hold (busy below the same device) would always run its full timeout */
++    (void)early;
+ }
+ 
+ /*
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+index a5c1c78..7449fde 100644
+--- a/gpu-port/xkpi/xnu/nmx_flight.cpp
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -27,6 +27,7 @@
+ static const char *const kFlightPath = "/Users/Shared/nmx-flight.log";
+ static const size_t kRing = 4u << 20;           /* bytes kept in memory */
+ static const size_t kChunk = 256u << 10;        /* bytes written per pass */
++static const size_t kPrealloc = 8u << 20;      /* file preallocated at start (see nmx_flight_start) */
+ 
+ static char gRing[kRing];
+ static uint64_t gHead, gTail, gDropped;         /* bytes ever buffered / ever taken for writing / overwritten unwritten */
+@@ -378,6 +379,17 @@ extern "C" void nmx_flight_start(void)
+     err = vnode_setattr(gVp, &va, gCtx);
+     if (err)
+         IOLog("NullMoth flight recorder: could not empty %s (%d)\n", kFlightPath, err);
++    /*
++     * Preallocate the file (zeros) so later writes land inside it: a write that grows the file also changes its length,
++     * which APFS commits separately, and a panic lost the last second of log that the per-step sync had written
++     * (Wildcat Lake tests 30 and 32: log ends ~1 s before the breadcrumb). Read it with  tr -d '\0' < file.
++     */
++    bzero(gChunkBuf, kChunk);
++    gOff = 0;
++    for (size_t done = 0; done < kPrealloc; done += kChunk)
++        flight_write(gChunkBuf, kChunk);
++    VNOP_FSYNC(gVp, MNT_WAIT, gCtx);
++    gOff = 0;
+     thread_t t;
+     if (kernel_thread_start(flight_writer, nullptr, &t) != KERN_SUCCESS) {
+         IOLog("NullMoth flight recorder: no writer thread\n");

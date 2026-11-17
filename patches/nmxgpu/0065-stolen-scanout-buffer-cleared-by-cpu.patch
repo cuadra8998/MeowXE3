@@ -1,0 +1,39 @@
+Subject: [PATCH 0065] Stolen scan-out buffer: cleared by the CPU, not by a GPU job
+
+Wildcat Lake test start 9 (nmxtrace=3) left "xe_bo_move: dma_resv_add_fence 0" in NVRAM and froze: NMXGPU's
+scan-out buffer (0053: a dumb buffer, so a user/device BO, placed in stolen memory) was being moved into place, xe
+had just queued the GPU job that zeroes a new user BO (xe_migrate_clear), and the Mac stopped right after.
+Linux never puts a user BO in stolen memory; its own console framebuffer there is a kernel BO, which xe does not
+clear (xe_bo_move: needs_clear only for ttm_bo_type_device without a tt).
+
+- fork_xe.py: while NMXGPU creates its buffer (nmx_fb_want_stolen) and the destination is XE_PL_STOLEN, xe_bo_move
+  skips the GPU clear (logs "NullMoth: scan-out buffer in stolen memory, cleared by the CPU"); nmx_fb_open() already
+  clears the buffer with the CPU before the first modeset. Every other BO is unchanged.
+  Open question this leaves: whether GPU writes to stolen memory (xe_migrate on XE_PL_STOLEN) work on Xe3 iGPUs.
+
+Applies on top of 0051-0064.
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -316,6 +316,20 @@
+ trace_calls("display/xe_plane_initial.c", "static struct xe_bo *\ninitial_plane_bo(struct xe_device *xe,\n\t\t struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static bool\nintel_alloc_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t      struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static void\nintel_find_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t     struct intel_initial_plane_config plane_configs[])\n{\n")
++
++# NullMoth's scan-out buffer, created through the dumb-buffer path, is a user (device) BO; xe clears a new user BO
++# with a GPU job (xe_migrate_clear), and in stolen memory that job is where Wildcat Lake test 9 froze (last step
++# "xe_bo_move: dma_resv_add_fence", right after the clear was queued). Linux never puts a user BO in stolen memory: its
++# own console framebuffer there is a kernel BO, which xe does not clear. While NullMoth creates its buffer
++# (nmx_fb_want_stolen) and the destination is stolen, the GPU clear is skipped; nmx_fb_open() clears it with the CPU.
++edit("xe_bo.c", [("\tneeds_clear = (ttm && ttm->page_flags & TTM_TT_FLAG_ZERO_ALLOC) ||\n"
++                  "\t\t(!ttm && ttm_bo->type == ttm_bo_type_device);\n",
++                  "\tneeds_clear = (ttm && ttm->page_flags & TTM_TT_FLAG_ZERO_ALLOC) ||\n"
++                  "\t\t(!ttm && ttm_bo->type == ttm_bo_type_device);\n"
++                  "\t{\n\t\textern int nmx_fb_want_stolen;\t/* override/src/nmx_fb_bridge.c */\n\n"
++                  "\t\tif (nmx_fb_want_stolen && new_mem->mem_type == XE_PL_STOLEN && needs_clear) {\n"
++                  "\t\t\tdrm_info(&xe->drm, \"NullMoth: scan-out buffer in stolen memory, cleared by the CPU\\n\");\n"
++                  "\t\t\tneeds_clear = false;\n\t\t}\n\t}\n", 1)])
+ 
+ # NullMoth's scan-out buffer (Wildcat Lake test 8 stopped in drm_client_framebuffer_create with "fb: scan-out buffer"):
+ # the dumb buffer in stolen memory, its BO creation and placement (xe_bo_move clears new stolen memory with a GPU job),

@@ -1,0 +1,253 @@
+Subject: [PATCH 0098] display: double-buffered frames for NMXAccel, flipped onto the panel at vertical blank
+
+With GPU compositing (accelerated head, 0095), NMXAccel copied each finished frame into the buffer the panel was
+scanning out, and dragging a window tore. The bridge now creates a second scan-out buffer (stolen memory, as the
+first) and offers nmx_fb_back (the buffer not on the outputs), nmx_fb_flip (a client commit that puts it on the
+plane, latched at vertical blank, then swaps the two) and nmx_fb_front; the framebuffer answers NMXAccel's
+nmxScanoutBack / nmxScanoutFlip, and nvScanoutInfo reports the buffer on the panel now. A flip that fails or takes
+over 100 ms (the 10 s flip_done stall a commit without a vblank event showed on this display engine) turns flipping
+off for the start, and frames are copied onto the visible buffer as before. Without a second buffer nothing changes.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 1c8412e..cc8bbb4 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -164,6 +164,7 @@ class NMXGPUFB : public IOFramebuffer {
+     int fFlags = 0;
+     IOService *fAccel = nullptr;            /* 0x200: the accelerator that armed this head (retained) */
+     volatile UInt32 fOpenedOnce = 0;
++    bool fFlipFailLogged = false;
+ 
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         NMXGPUFB *me = (NMXGPUFB *)p0;
+@@ -300,12 +301,33 @@ public:
+             if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+             return fn->isEqualTo("nvAllocVram") ? nmxVramAlloc(r) : nmxVramFree(r);
+         }
++        /* double-buffered frames (NMXAccel 0052): the buffer to copy the next frame into, and its flip onto the panel */
++        if (fn->isEqualTo("nmxScanoutBack")) {
++            NVRMVramRequest *r = (NVRMVramRequest *)p1;
++            if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++            uint64_t kva = 0; uint32_t pitch = 0;
++            if (!fDev || nmx_fb_back(fDev, &kva, &pitch) != 0) return kIOReturnUnsupported;
++            r->kva = (void *)(uintptr_t)kva; r->phys = 0;
++            r->actualSize = (unsigned long long)pitch * fInfo.height;
++            r->width = fInfo.width; r->height = fInfo.height; r->pitch = pitch;
++            return kIOReturnSuccess;
++        }
++        if (fn->isEqualTo("nmxScanoutFlip")) {
++            if (!fDev) return kIOReturnNotReady;
++            int err = nmx_fb_flip(fDev);
++            if (err && !fFlipFailLogged) { fFlipFailLogged = true; nmx_trace("publish: accel: flips off (err)", err); }
++            return err ? kIOReturnError : kIOReturnSuccess;
++        }
+         if (fn->isEqualTo("nvScanoutInfo")) {
+             /* the real physical address of the live scan-out (stolen memory): with phys 0 CoreDisplay failed
+                MPAccessSurfaceForDisplayDevice and WindowServer stayed on the CPU (ericek111) */
+             NVRMVramRequest *r = (NVRMVramRequest *)p1;
+             if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
+-            r->kva = (void *)(uintptr_t)fInfo.kva;
++            /* the CPU view of the buffer on the panel now (flips swap the two); the physical address stays the first
++               buffer's, which the display machine's live-scan-out resource was made over */
++            uint64_t front = fInfo.kva;
++            if (fDev) nmx_fb_front(fDev, &front);
++            r->kva = (void *)(uintptr_t)front;
+             r->phys = fInfo.phys;
+             r->actualSize = (unsigned long long)fInfo.pitch * fInfo.height;
+             r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+index 46bac12..e1efcf9 100644
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -13,6 +13,8 @@
+ #include <linux/slab.h>
+ #include <linux/pci.h>
+ #include <linux/iosys-map.h>
++#include <linux/ktime.h>
++#include <linux/mutex.h>
+ 
+ #include <drm/drm_client.h>
+ #include <drm/drm_device.h>
+@@ -34,6 +36,16 @@ struct nmx_fb {
+     struct nmx_fb_info info;
+     int registered;     /* drm_client_register returned: hotplugs from here on are real */
+     int dpms_on;        /* outputs lit (the open leaves them on); nmx_fb_power skips a request for the current state */
++    /*
++     * Double buffering for NMXAccel's copied frames (nmx_fb_back / nmx_fb_flip): 'buffer' is always the one on the
++     * outputs, 'back' the one a frame is copied into before it is flipped onto them at vertical blank. A copy into the
++     * buffer being scanned out tore (dragging a window, Wildcat Lake).
++     */
++    struct drm_client_buffer *back;
++    struct iosys_map back_map;
++    int back_mapped;
++    int flips_ok;       /* flipping works: off when there is no back buffer or a flip took over kFlipMaxNs */
++    struct mutex flip_lock;
+ };
+ 
+ void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+@@ -141,6 +153,10 @@ static void bridge_free(struct nmx_fb *fb)
+         drm_client_buffer_vunmap(fb->buffer);
+     if (fb->buffer != NULL)
+         drm_client_framebuffer_delete(fb->buffer);
++    if (fb->back_mapped)
++        drm_client_buffer_vunmap(fb->back);
++    if (fb->back != NULL)
++        drm_client_framebuffer_delete(fb->back);
+     drm_client_release(&fb->client);
+     kfree(fb);
+ }
+@@ -248,6 +264,27 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
+     nmx_trace("fb: clearing the buffer (phys)", (long)base);
+     memset(__DECONST(char *, va), 0, size);       /* black until WindowServer draws */
+ 
++    /* the back buffer of NMXAccel's double-buffered frames (optional: without it frames are copied onto 'buffer') */
++    mutex_init(&fb->flip_lock);
++    nmx_fb_want_stolen = 1;
++    fb->back = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
++    nmx_fb_want_stolen = 0;
++    if (IS_ERR(fb->back)) {
++        printf("NullMoth display: no second scan-out buffer (%ld): frames are copied onto the visible one\n",
++               PTR_ERR(fb->back));
++        fb->back = NULL;
++    } else if (fb->back->fb->pitches[0] != out->pitch || drm_client_buffer_vmap(fb->back, &fb->back_map) != 0) {
++        printf("NullMoth display: the second scan-out buffer is unusable: frames are copied onto the visible one\n");
++        drm_client_framebuffer_delete(fb->back);
++        fb->back = NULL;
++    } else {
++        fb->back_mapped = 1;
++        char *bva = fb->back_map.is_iomem ? (char *)fb->back_map.vaddr_iomem : (char *)fb->back_map.vaddr;
++        memset(bva, 0, size);
++        fb->flips_ok = 1;
++    }
++    nmx_trace("fb: back buffer for flips", fb->flips_ok);
++
+     mutex_lock(&fb->client.modeset_mutex);
+     drm_client_for_each_modeset(ms, &fb->client)
+         if (ms->mode != NULL)
+@@ -290,6 +327,96 @@ void nmx_fb_close(void *dev)
+             drm_client_modeset_dpms(&fbs[i].fb->client, DRM_MODE_DPMS_OFF);
+ }
+ 
++static struct nmx_fb *fb_of(void *dev)
++{
++    for (int i = 0; i < MAX_FB; i++)
++        if (fbs[i].dev == dev && fbs[i].fb != NULL)
++            return fbs[i].fb;
++    return NULL;
++}
++
++static uint64_t map_kva(struct iosys_map *m)
++{
++    return (uint64_t)(uintptr_t)(m->is_iomem ? (void *)m->vaddr_iomem : m->vaddr);
++}
++
++/* the buffer on the outputs now (where an unflipped copy must go) */
++int nmx_fb_front(void *dev, uint64_t *kva)
++{
++    struct nmx_fb *fb = fb_of(dev);
++    if (fb == NULL || !fb->mapped)
++        return ENODEV;
++    mutex_lock(&fb->flip_lock);
++    *kva = map_kva(&fb->map);
++    mutex_unlock(&fb->flip_lock);
++    return 0;
++}
++
++/* the buffer the next frame goes into (not on the outputs: the last flip has landed, nmx_fb_flip is synchronous) */
++int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch)
++{
++    struct nmx_fb *fb = fb_of(dev);
++    if (fb == NULL)
++        return ENODEV;
++    mutex_lock(&fb->flip_lock);
++    int err = fb->flips_ok && fb->back != NULL ? 0 : ENODEV;
++    if (!err) {
++        *kva = map_kva(&fb->back_map);
++        *pitch = fb->back->fb->pitches[0];
++    }
++    mutex_unlock(&fb->flip_lock);
++    return err;
++}
++
++/*
++ * Puts the back buffer on the outputs (the plane's new address latches at vertical blank) and swaps the roles. The
++ * commit waits for flip_done, so the old front is free when this returns. A flip that takes longer than kFlipMaxNs
++ * (the 10 s flip_done timeout of a commit whose vblank never comes, seen on this display engine) turns flipping off
++ * for this start: NMXAccel then copies onto the visible buffer again (nmx_fb_back fails).
++ */
++#define kFlipMaxNs (100ull * 1000 * 1000)
++int nmx_fb_flip(void *dev)
++{
++    struct nmx_fb *fb = fb_of(dev);
++    struct drm_mode_set *ms;
++    if (fb == NULL)
++        return ENODEV;
++    mutex_lock(&fb->flip_lock);
++    if (!fb->flips_ok || fb->back == NULL || !fb->dpms_on) {
++        mutex_unlock(&fb->flip_lock);
++        return ENODEV;
++    }
++    mutex_lock(&fb->client.modeset_mutex);
++    drm_client_for_each_modeset(ms, &fb->client)
++        if (ms->mode != NULL)
++            ms->fb = fb->back->fb;
++    mutex_unlock(&fb->client.modeset_mutex);
++    uint64_t t0 = ktime_get_ns();
++    int err = -drm_client_modeset_commit(&fb->client);
++    uint64_t dt = ktime_get_ns() - t0;
++    if (err) {
++        mutex_lock(&fb->client.modeset_mutex);
++        drm_client_for_each_modeset(ms, &fb->client)
++            if (ms->mode != NULL)
++                ms->fb = fb->buffer->fb;
++        mutex_unlock(&fb->client.modeset_mutex);
++        fb->flips_ok = 0;
++        printf("NullMoth display: a flip failed (%d): frames are copied onto the visible buffer from now on\n", err);
++    } else {
++        struct drm_client_buffer *b = fb->buffer;
++        struct iosys_map m = fb->map;
++        fb->buffer = fb->back; fb->map = fb->back_map;
++        fb->back = b; fb->back_map = m;
++        if (dt > kFlipMaxNs) {
++            fb->flips_ok = 0;
++            printf("NullMoth display: a flip took %llu ms: frames are copied onto the visible buffer from now on\n",
++                   (unsigned long long)(dt / 1000000));
++        }
++    }
++    mutex_unlock(&fb->flip_lock);
++    return err;
++}
++
+ /* display sleep and wake from macOS (IOFramebuffer power) */
+ int nmx_fb_power(void *dev, int on)
+ {
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmx_port.h
+index 35a0859..7296dbe 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_port.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_port.h
+@@ -29,6 +29,10 @@ void nmx_fb_before_attach(void);
+ int nmx_fb_open(void *dev, struct nmx_fb_info *out);
+ void nmx_fb_close(void *dev);
+ int nmx_fb_power(void *dev, int on);
++/* NMXAccel's double-buffered frames: the buffer on the outputs, the one to copy the next frame into, and the flip */
++int nmx_fb_front(void *dev, uint64_t *kva);
++int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch);
++int nmx_fb_flip(void *dev);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
+index 35a0859..7296dbe 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
+@@ -29,6 +29,10 @@ void nmx_fb_before_attach(void);
+ int nmx_fb_open(void *dev, struct nmx_fb_info *out);
+ void nmx_fb_close(void *dev);
+ int nmx_fb_power(void *dev, int on);
++/* NMXAccel's double-buffered frames: the buffer on the outputs, the one to copy the next frame into, and the flip */
++int nmx_fb_front(void *dev, uint64_t *kva);
++int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch);
++int nmx_fb_flip(void *dev);
+ #ifdef __cplusplus
+ }
+ #endif

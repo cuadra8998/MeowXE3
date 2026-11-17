@@ -1,0 +1,60 @@
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h b/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
+index 1c675fb..6b2bd80 100644
+--- a/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
+@@ -17,6 +17,15 @@
+  */
+ #define scnprintf nmx_xnu_scnprintf
+ #define vscnprintf nmx_xnu_vscnprintf
++/*
++ * The macOS 26 SDK's kernel headers reach <uuid/uuid.h>, whose uuid_copy(uuid_t, const uuid_t) collides with
++ * LinuxKPI's static inline uuid_copy(linux_uuid_t *, ...). Apple's is taken under another name, here and once: its
++ * include guard keeps any later #include of it from declaring the name again.
++ */
++#define uuid_copy nmx_xnu_uuid_copy
++#if __has_include(<uuid/uuid.h>)
++#include <uuid/uuid.h>
++#endif
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <stddef.h>
+@@ -51,6 +60,7 @@
+ #include <sys/kauth.h>
+ #undef scnprintf
+ #undef vscnprintf
++#undef uuid_copy
+ /* mach/error.h names error subsystems err_vm, err_kern...; i915 uses err_vm as a goto label */
+ #undef err_vm
+ #undef err_kern
+diff --git a/gpu-port/xkpi/override/src/linux_pci.c b/gpu-port/xkpi/override/src/linux_pci.c
+index 3a79f2b..8b9e631 100644
+--- a/gpu-port/xkpi/override/src/linux_pci.c
++++ b/gpu-port/xkpi/override/src/linux_pci.c
+@@ -84,6 +84,14 @@
+ #include <linux/backlight.h>
+ 
+ #include "backlight_if.h"
++
++/*
++ * Defined in linux_compat.c (this port's). FreeBSD's LinuxKPI headers declared them until the 2026 rename to
++ * lkpi_pci_drivers/lkpi_pci_lock made its own copies private; declared here so this fork keeps building on either.
++ */
++extern struct list_head pci_drivers;
++extern struct list_head pci_devices;
++extern spinlock_t pci_lock;
+ #include "pcib_if.h"
+ 
+ /* Undef the linux function macro defined in linux/pci.h */
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index a97943d..1de2795 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -240,7 +240,7 @@ static void retire_boot_framebuffer(IOService *gpu, IOService *mine)
+     }
+     for (IORegistryEntry *e; (e = it->getNextObject()) != nullptr; ) {
+         IOFramebuffer *f = OSDynamicCast(IOFramebuffer, e);
+-        if (f != nullptr && f != mine && strstr(f->getMetaClass()->getClassName(), "NDRV") != nullptr)
++        if (f != nullptr && f != mine && f->metaCast("IONDRVFramebuffer") != nullptr)
+             victims->setObject(f);
+     }
+     it->release();

@@ -1,0 +1,44 @@
+diff --git a/src/vulkan/wsi/wsi_common_metal_layer.m b/src/vulkan/wsi/wsi_common_metal_layer.m
+index 6308d70..20b89d3 100644
+--- a/src/vulkan/wsi/wsi_common_metal_layer.m
++++ b/src/vulkan/wsi/wsi_common_metal_layer.m
+@@ -332,27 +332,18 @@
+    @autoreleasepool {
+       id<CAMetalDrawable> drawable = [(id<CAMetalDrawable>)*drawable_ptr autorelease];
+ 
+-      id<MTLCommandBuffer> commandBuffer = [context->commandQueue commandBuffer];
+-      id<MTLBlitCommandEncoder> commandEncoder = [commandBuffer blitCommandEncoder];
+-
+-      NSUInteger image_size = height * row_pitch;
+-      id<MTLBuffer> image_buffer = [[context->device newBufferWithBytesNoCopy:buffer
+-         length:image_size
+-         options:MTLResourceStorageModeShared
+-         deallocator:nil] autorelease];
+-
+-      [commandEncoder copyFromBuffer:image_buffer
+-         sourceOffset:0
+-         sourceBytesPerRow:row_pitch
+-         sourceBytesPerImage:image_size
+-         sourceSize:MTLSizeMake(width, height, 1)
+-         toTexture:drawable.texture
+-         destinationSlice:0
+-         destinationLevel:0
+-         destinationOrigin:MTLOriginMake(0, 0, 0)];
+-      [commandEncoder endEncoding];
+-      [commandBuffer presentDrawable:drawable];
+-      [commandBuffer commit];
++      /*
++       * MeowXE3: upload the frame with a CPU copy instead of wrapping the swapchain image's mapping in a no-copy
++       * MTLBuffer. A Metal driver that is not Apple's (NullMoth's NVMTL over the same GPU) imports such pages and keeps
++       * them; destroying the swapchain then waited forever in the kernel to unmap them (Minecraft hung on maximize).
++       * In software mode the layer's drawables are not framebuffer-only, so they can be written directly.
++       */
++      (void)context;
++      [drawable.texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
++                          mipmapLevel:0
++                            withBytes:buffer
++                          bytesPerRow:row_pitch];
++      [drawable present];
+ 
+       *drawable_ptr = nil;
+    }

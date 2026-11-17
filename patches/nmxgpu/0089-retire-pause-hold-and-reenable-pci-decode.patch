@@ -1,0 +1,125 @@
+Subject: [PATCH 0089] retire: pause the display hold around it, turn PCI decode back on after it
+
+Wildcat Lake test 34 (0088): the Mac stopped entirely (no heartbeat, caps lock dead) inside the boot framebuffer's
+synchronous terminate, with no panic; the preallocated flight log kept every line up to "terminate requested".
+- The display hold is paused (NMXGPU's adjustBusy -1) for the synchronous terminate and taken again after it:
+  IOKit's termination work below the same PCI device may wait for NMXGPU to go quiet. ericek111's NMXVGAFB
+  terminates first and holds after.
+- After the retirement, memory decode and bus mastering are turned back on (IONDRVFramebuffer's stop may turn
+  them off while xe drives the GPU), as NMXVGAFB and the early retirement do; the command register is traced.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 001c2fa..6c33b1e 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -65,6 +65,11 @@ class NMXGPU : public IOService {
+     void holdDisplay();
+     void releaseDisplay(const char *why);
+     static void holdCapFire(thread_call_param_t p0, thread_call_param_t);
++public:
++    /* holding_: 0 none, 1 held, 2 paused (around the boot framebuffer's synchronous retirement, xnu/nmx_fb.cpp) */
++    void pauseDisplayHold();
++    void resumeDisplayHold();
++private:
+     /* nmxtrace: what macOS does to this GPU and to the firmware's boot framebuffer around the publish */
+     UInt8 pmCap_ = 0;
+     void watchBootFramebuffer();
+@@ -481,12 +486,46 @@ void NMXGPU::holdDisplay()
+     nmx_trace("attach: display hold: registry busy until the framebuffer is published (30 s at most)", 0);
+ }
+ 
++/*
++ * A synchronous terminate of the boot framebuffer waits for IOKit's termination work, which did not finish while
++ * NMXGPU (below the same PCI device) was busy: test 34 stopped inside the retirement with no panic. The hold is
++ * lifted for it; the termination itself keeps the registry busy meanwhile.
++ */
++void NMXGPU::pauseDisplayHold()
++{
++    if (OSCompareAndSwap(1, 2, &holding_)) {
++        adjustBusy(-1);
++        nmx_trace("publish: display hold paused for the retirement", 0);
++    }
++}
++
++void NMXGPU::resumeDisplayHold()
++{
++    if (OSCompareAndSwap(2, 1, &holding_)) {
++        adjustBusy(1);
++        nmx_trace("publish: display hold resumed", 0);
++    }
++}
++
++extern "C++" void nmx_gpu_pause_display_hold(IOService *gpu, bool pause)
++{
++    NMXGPU *g = OSDynamicCast(NMXGPU, gpu);
++    if (g == nullptr)
++        return;
++    if (pause)
++        g->pauseDisplayHold();
++    else
++        g->resumeDisplayHold();
++}
++
+ void NMXGPU::releaseDisplay(const char *why)
+ {
+     if (OSCompareAndSwap(1, 0, &holding_)) {
+         adjustBusy(-1);
+         IOLog("NullMoth GPU: display hold released (%s)\n", why);
+         nmx_trace("attach: display hold released", 0);
++    } else if (OSCompareAndSwap(2, 0, &holding_)) {
++        nmx_trace("attach: display hold released (it was paused)", 0);
+     }
+     if (holdCap_ != nullptr && thread_call_cancel(holdCap_)) {
+         thread_call_free(holdCap_);
+@@ -501,6 +540,8 @@ void NMXGPU::holdCapFire(thread_call_param_t p0, thread_call_param_t)
+     if (OSCompareAndSwap(1, 0, &self->holding_)) {
+         self->adjustBusy(-1);
+         IOLog("NullMoth GPU: display hold ran out (30 s); WindowServer goes on\n");
++    } else {
++        OSCompareAndSwap(2, 0, &self->holding_);
+     }
+     self->release();   /* the timer's reference; the call itself is freed by releaseDisplay or stays allocated */
+ }
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 48ca335..383b370 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -12,6 +12,7 @@
+ #include <pexpert/pexpert.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <IOKit/IODeviceMemory.h>
++#include <IOKit/pci/IOPCIDevice.h>
+ #include <kern/thread_call.h>
+ #include "nmx_port.h"
+ 
+@@ -293,6 +294,8 @@ OSDefineMetaClassAndStructors(NMXGPUFB, IOFramebuffer)
+  * has freed (an integrated GPU's stolen memory). Retire it the way a removed display goes away. Boot argument
+  * -nmxkeepndrv keeps it.
+  */
++void nmx_gpu_pause_display_hold(IOService *gpu, bool pause);   /* xnu/nmx_kext.cpp: the display hold */
++
+ static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early = false)
+ {
+     int dummy = 0;
+@@ -344,9 +347,21 @@ static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early
+          * boot framebuffer and its clients are stopped when this returns, before NMXGPU's framebuffer starts and,
+          * with the display hold (xnu/nmx_kext.cpp), before WindowServer has opened either.
+          */
++        nmx_gpu_pause_display_hold(gpu, true);
+         nmx_trace("publish: retire: terminate requested", (long)i);
+         bool done = f->terminate(kIOServiceRequired | kIOServiceSynchronous);
+         nmx_trace("publish: retire: terminate returned (done)", (long)done);
++        /*
++         * IONDRVFramebuffer's stop may turn the device's memory decode and bus mastering off; xe is already driving
++         * the GPU here, and its next register access to a BAR with decode off can stop the whole Mac. Back on, as
++         * NMXVGAFB and the early retirement (xnu/nmx_kext.cpp) do.
++         */
++        if (IOPCIDevice *pd = OSDynamicCast(IOPCIDevice, pci)) {
++            nmx_trace("publish: retire: PCI command after the retirement", pd->configRead16(kIOPCIConfigCommand));
++            pd->setMemoryEnable(true);
++            pd->setBusMasterEnable(true);
++        }
++        nmx_gpu_pause_display_hold(gpu, false);
+     }
+     victims->release();
+     /* the synchronous terminate has finished IONDRVFramebuffer's stop; no wait for the PCI device to go quiet, which

@@ -1,0 +1,51 @@
+From 4745d3a8ce3c60ca17a9309a64dfe177e828a5c4 Mon Sep 17 00:00:00 2001
+From: nmx <nmx@local>
+Date: Sun, 15 Nov 2026 21:35:19 -0800
+Subject: [PATCH] NMXAccel: arm NMXGPU's panel framebuffer (NMXIntelGPUFB) as
+ head 0, as the VM display
+
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 0886b1d..f19c47b 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -269,6 +269,7 @@ public:
+     IOPCIDevice *fPCI = nullptr;
+     IONotifier *fFBNote = nullptr;
+     IONotifier *fIntelNote = nullptr;
++    IONotifier *fNmxGpuFbNote = nullptr;   // NMXGPU's panel framebuffer, accelerated-head mode
+     static NVAccel *gAccel;
+     IOService *fFB = nullptr;
+     IOService *volatile fFBs[kNvMaxFB] = {};
+@@ -280,7 +281,9 @@ public:
+         NVAccel *me = (NVAccel *)target;
+         if (!me || !newService) return true;
+ #ifdef NMX_ACCEL
+-        if (newService->metaCast("NMXVGAFB") && !gNmxVmDisplay) {
++        // NMXIntelGPUFB: NMXGPU's own panel framebuffer (a real Intel display engine) in its accelerated-head mode
++        // (nullmoth-fbflags 0x200), published and armed exactly as the VM display is
++        if ((newService->metaCast("NMXVGAFB") || newService->metaCast("NMXIntelGPUFB")) && !gNmxVmDisplay) {
+             gNmxVmDisplay = true;
+             gNvHeadless = 0;
+             me->removeProperty("NMXAccelHeadless");
+@@ -699,6 +702,14 @@ public:
+                 fFBNote = addMatchingNotification(gIOFirstPublishNotification, fbm, &NVAccel::fbPublished, this, nullptr, 0);
+                 fbm->release();
+                 ALOG("watching for NVRMFramebuffer to publish -> notifier %p", fFBNote);
++#ifdef NMX_ACCEL
++                if (OSDictionary *gm = serviceMatching("NMXIntelGPUFB")) {
++                    fNmxGpuFbNote = addMatchingNotification(gIOFirstPublishNotification, gm, &NVAccel::fbPublished, this,
++                                                            nullptr, 0);
++                    gm->release();
++                    ALOG("watching for NMXGPU's panel framebuffer (NMXIntelGPUFB) -> notifier %p", fNmxGpuFbNote);
++                }
++#endif
+                 // a laptop whose built-in panel is on the Intel GPU: NMIntelFB publishes as head 4 of this accelerator
+                 if (OSDictionary *im = serviceMatching("NMIntelFB")) {
+                     fIntelNote = addMatchingNotification(gIOFirstPublishNotification, im, &NVAccel::fbPublished, this, nullptr, 0);
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,50 @@
+Subject: [PATCH 0085] framebuffer: retire the boot framebuffer before NMXGPU's framebuffer starts (fbflags 0x40)
+
+Wildcat Lake test 29 (fbflags 0x20): IOFramebuffer::terminate of the boot framebuffer, run after NMXGPU's framebuffer
+had started, delivered its group notification to AppleUpstreamUserClient, which panicked on NULL in
+fbNotificationOccurred. Test 28 (no 0x20) retired the same way without a panic. Bring-up switch nullmoth-fbflags 0x40:
+retire the boot framebuffer after the modeset, before NMXGPU's IOFramebuffer is created, and wait for the PCI device
+to go quiet (up to 3 s) so its stop is done first.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 14e7d0b..ba68d2b 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -26,10 +26,13 @@ extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
+  * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
+  * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer,
+  * 0x8 = keep the firmware's boot framebuffer (as -nmxkeepndrv), 0x10 = retire it before the GPU is offered to the
+- * drivers instead of after the publish (xnu/nmx_kext.cpp), 0x20 = IOFramebuffer's own power handling (below).
++ * drivers instead of after the publish (xnu/nmx_kext.cpp), 0x20 = IOFramebuffer's own power handling (below),
++ * 0x40 = retire it after the modeset but before NMXGPU's framebuffer starts: retired after the start, with 0x20,
++ * IOFramebuffer::terminate's group notification reached AppleUpstreamUserClient on the new framebuffer, which
++ * panicked on NULL in fbNotificationOccurred (test 29).
+  */
+ enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8, kFbRetireEarly = 0x10,
+-       kFbIOGraphicsPower = 0x20 };
++       kFbIOGraphicsPower = 0x20, kFbRetireBeforeStart = 0x40 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -299,6 +302,10 @@ static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early
+         nmx_trace("publish: retire: already done before the attach (nullmoth-fbflags 0x10)", 0);
+         return;
+     }
++    if (!early && (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbRetireBeforeStart)) {
++        nmx_trace("publish: retire: already done before the framebuffer start (nullmoth-fbflags 0x40)", 0);
++        return;
++    }
+     if (!early && (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbKeepBootFb)) {
+         FBLOG("nullmoth-fbflags 0x8: keeping the boot framebuffer");
+         nmx_trace("publish: retire: kept (nullmoth-fbflags 0x8)", 0);
+@@ -371,6 +378,10 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+         FBLOG("no framebuffer (%d)", err);
+         return nullptr;
+     }
++    if (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbRetireBeforeStart) {
++        nmx_trace("publish: retiring the boot framebuffer before the start (nullmoth-fbflags 0x40)", 0);
++        retire_boot_framebuffer(gpu, nullptr, true);
++    }
+     nmx_trace("publish: IOFramebuffer init and attach", 0);
+     NMXGPUFB *fb = OSTypeAlloc(NMXGPUFB);
+     if (fb == nullptr || !fb->initWith(dev, info) || !fb->attach(gpu)) {

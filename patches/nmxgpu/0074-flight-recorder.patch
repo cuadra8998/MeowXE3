@@ -1,0 +1,306 @@
+Subject: [PATCH 0074] Flight recorder: with nmxtrace, the port's whole log is synced to /Users/Shared/nmx-flight.log
+
+The Wildcat Lake freezes left no log: the unified log reaches the disk in batches and lost the last seconds every
+time, and an NVRAM breadcrumb holds one line (and writing it often stalled the firmware). With the boot argument
+nmxtrace set, everything the port prints now also goes into a 4 MiB ring buffer with a time stamp per line, and once
+the attach starts (root file system up) a kernel thread appends it to /Users/Shared/nmx-flight.log every 40 ms and
+syncs it (VNOP_WRITE IO_SYNC + VNOP_FSYNC). After a hang the next start finds the log up to the last fraction of a
+second. Nothing is buffered or written without nmxtrace.
+
+- xnu/nmx_flight.cpp (new): the ring buffer (interrupt-safe spin lock), the writer thread, nmx_flight_printf/_vlog/
+  _iolog/_start.
+- bsdcompat/include/nmxkpi_prelude.h: printf -> nmx_flight_printf for every C file (printk included).
+- bsdcompat/src/nmx_misc.c: the port's vprintf goes through nmx_flight_vlog.
+- bsdcompat/include/nmx_xnu.h (copied to nmxxnu/ by ccxx.sh), xnu/nmx_fb.cpp: IOLog -> nmx_flight_iolog in the IOKit
+  glue.
+- xnu/nmx_kext.cpp: the attach starts the writer once the firmware folder (and so the root file system) is there.
+Note: NMXNPU's kext glue includes nmx_xnu.h too; it would need nmx_flight.cpp linked in if it is built.
+
+Applies on top of 0051-0073.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+new file mode 100644
+--- /dev/null
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -0,0 +1,202 @@
++/*
++ * Flight recorder for bring-up (Wildcat Lake: the Mac froze hard a moment after NMXGPU's framebuffer appeared, and the
++ * unified log, which reaches the disk in batches, lost the last seconds every time; an NVRAM breadcrumb held one line).
++ *
++ * With the boot argument nmxtrace set, everything the port prints - LinuxKPI/drm/xe printf and printk (through the
++ * prelude's printf), the port's vprintf, and IOLog in the IOKit glue - also goes into a 4 MiB ring buffer, with a time
++ * stamp per line. Once the attach starts (the root file system is up), a kernel thread appends the ring to
++ * /Users/Shared/nmx-flight.log every 40 ms and syncs it, so after a hang the next start finds the log up to the last
++ * fraction of a second. Without nmxtrace nothing is buffered or written.
++ */
++#include <IOKit/IOLib.h>
++#include <libkern/OSAtomic.h>
++#include <libkern/libkern.h>
++#include <sys/types.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/mount.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <i386/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
++
++#undef IOLog
++
++static const char *const kFlightPath = "/Users/Shared/nmx-flight.log";
++static const size_t kRing = 4u << 20;           /* bytes kept in memory */
++static const size_t kChunk = 256u << 10;        /* bytes written per pass */
++
++static char gRing[kRing];
++static uint64_t gHead, gTail, gDropped;         /* bytes ever buffered / ever taken for writing / overwritten unwritten */
++static volatile UInt32 gLock;
++static int gState = -1;                         /* -1 not decided, 0 off, 1 on */
++static bool gLineStart = true;
++static bool gStarted;
++static vnode_t gVp;
++static vfs_context_t gCtx;
++static off_t gOff;
++static char *gChunkBuf;
++
++static bool flight_on()
++{
++    if (gState < 0) {
++        int v = 0;
++        gState = (PE_parse_boot_argn("nmxtrace", &v, sizeof(v)) && v > 0) ? 1 : 0;
++    }
++    return gState == 1;
++}
++
++/* callable from any context the port prints from, interrupt handlers included: a spin lock with interrupts off */
++static boolean_t ring_lock()
++{
++    boolean_t s = ml_set_interrupts_enabled(FALSE);
++    while (!OSCompareAndSwap(0, 1, &gLock))
++        ;
++    return s;
++}
++
++static void ring_unlock(boolean_t s)
++{
++    OSCompareAndSwap(1, 0, &gLock);
++    ml_set_interrupts_enabled(s);
++}
++
++static void ring_put(const char *p, size_t n)
++{
++    for (size_t i = 0; i < n; i++)
++        gRing[(gHead + i) % kRing] = p[i];
++    gHead += n;
++    if (gHead - gTail > kRing) {
++        gDropped += gHead - gTail - kRing;
++        gTail = gHead - kRing;
++    }
++}
++
++static void flight_append(const char *s, size_t n)
++{
++    if (!flight_on() || s == nullptr || n == 0)
++        return;
++    uint64_t ns;
++    absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++    char ts[32];
++    int tl = snprintf(ts, sizeof(ts), "[%5llu.%06llu] ", ns / 1000000000ull, (ns / 1000ull) % 1000000ull);
++    if (tl < 0)
++        tl = 0;
++    boolean_t st = ring_lock();
++    while (n > 0) {
++        if (gLineStart)
++            ring_put(ts, (size_t)tl);
++        const char *nl = (const char *)memchr(s, '\n', n);
++        size_t seg = nl ? (size_t)(nl - s) + 1 : n;
++        ring_put(s, seg);
++        gLineStart = nl != nullptr;
++        s += seg;
++        n -= seg;
++    }
++    ring_unlock(st);
++}
++
++static void flight_vemit(bool viaIOLog, const char *fmt, va_list ap)
++{
++    char buf[640];
++    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++    if (n < 0)
++        return;
++    if (viaIOLog)
++        IOLog("%s", buf);
++    else
++        printf("%s", buf);
++    flight_append(buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
++}
++
++/* the prelude maps printf here for every C file of the port */
++extern "C" int nmx_flight_printf(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    flight_vemit(false, fmt, ap);
++    va_end(ap);
++    return 0;
++}
++
++/* the port's vprintf (bsdcompat/src/nmx_misc.c), which went to IOLogv */
++extern "C" void nmx_flight_vlog(const char *fmt, va_list ap)
++{
++    flight_vemit(true, fmt, ap);
++}
++
++/* IOLog in the IOKit glue (nmxxnu/nmx_xnu.h maps it here) */
++extern "C" void nmx_flight_iolog(const char *fmt, ...)
++{
++    va_list ap;
++    va_start(ap, fmt);
++    flight_vemit(true, fmt, ap);
++    va_end(ap);
++}
++
++static void flight_write(const char *p, size_t n)
++{
++    uio_t uio = uio_create(1, gOff, UIO_SYSSPACE, UIO_WRITE);
++    if (uio == nullptr)
++        return;
++    uio_addiov(uio, CAST_USER_ADDR_T(p), n);
++    if (VNOP_WRITE(gVp, uio, IO_SYNC, gCtx) == 0)
++        gOff += (off_t)(n - (size_t)uio_resid(uio));
++    uio_free(uio);
++}
++
++static void flight_writer(void *, wait_result_t)
++{
++    for (;;) {
++        IOSleep(40);
++        boolean_t st = ring_lock();
++        uint64_t from = gTail, to = gHead, dropped = gDropped;
++        if (to - from > kChunk)
++            to = from + kChunk;
++        size_t n = (size_t)(to - from);
++        for (size_t i = 0; i < n; i++)
++            gChunkBuf[i] = gRing[(from + i) % kRing];
++        gTail = to;
++        gDropped = 0;
++        ring_unlock(st);
++        if (dropped) {
++            char note[96];
++            int l = snprintf(note, sizeof(note), "\n[flight recorder: %llu bytes overwritten before they were written]\n",
++                             dropped);
++            if (l > 0)
++                flight_write(note, (size_t)l);
++        }
++        if (n) {
++            flight_write(gChunkBuf, n);
++            VNOP_FSYNC(gVp, MNT_WAIT, gCtx);
++        }
++    }
++}
++
++/* called by the attach once the root file system is up; the ring holds everything printed since the kext loaded */
++extern "C" void nmx_flight_start(void)
++{
++    if (!flight_on() || gStarted)
++        return;
++    gStarted = true;
++    gChunkBuf = (char *)IOMalloc(kChunk);
++    gCtx = vfs_context_create(nullptr);
++    if (gChunkBuf == nullptr || gCtx == nullptr) {
++        IOLog("NullMoth flight recorder: out of memory\n");
++        return;
++    }
++    errno_t err = vnode_open(kFlightPath, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, 0644, 0, &gVp, gCtx);
++    if (err) {
++        IOLog("NullMoth flight recorder: cannot open %s (%d)\n", kFlightPath, err);
++        return;
++    }
++    thread_t t;
++    if (kernel_thread_start(flight_writer, nullptr, &t) != KERN_SUCCESS) {
++        IOLog("NullMoth flight recorder: no writer thread\n");
++        return;
++    }
++    thread_deallocate(t);
++    nmx_flight_iolog("NullMoth flight recorder: writing to %s every 40 ms\n", kFlightPath);
++}
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h b/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxkpi_prelude.h
+@@ -60,6 +60,10 @@
+ #include <sys/kauth.h>
+ #undef scnprintf
+ #undef vscnprintf
++/* the flight recorder (xnu/nmx_flight.cpp, active with nmxtrace): every printf of the port, printk included, also
++ * lands in its ring buffer and, once the attach runs, in /Users/Shared/nmx-flight.log. xnu's headers are done. */
++int nmx_flight_printf(const char *fmt, ...) __printflike(1, 2);
++#define printf nmx_flight_printf
+ #undef uuid_copy
+ /* mach/error.h names error subsystems err_vm, err_kern...; i915 uses err_vm as a goto label */
+ #undef err_vm
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_misc.c b/gpu-port/xkpi/bsdcompat/src/nmx_misc.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_misc.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_misc.c
+@@ -138,10 +138,12 @@
+             return (void *)(uintptr_t)p;
+     return NULL;
+ }
++
++void nmx_flight_vlog(const char *fmt, va_list ap);    /* xnu/nmx_flight.cpp: IOLog, plus the flight recorder */
+ 
+ int nmx_vprintf(const char *fmt, va_list ap)
+ {
+-    IOLogv(fmt, ap);
++    nmx_flight_vlog(fmt, ap);
+     return 0;
+ }
+ 
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+@@ -186,4 +186,10 @@
+ #ifdef __cplusplus
+ }
+ #endif
++
++#ifdef __cplusplus
++/* IOLog of the IOKit glue also goes to the flight recorder (xnu/nmx_flight.cpp, active with nmxtrace) */
++extern "C" void nmx_flight_iolog(const char *fmt, ...) __printflike(1, 2);
++#define IOLog nmx_flight_iolog
+ #endif
++#endif
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -14,6 +14,10 @@
+ #include <IOKit/IODeviceMemory.h>
+ #include <kern/thread_call.h>
+ #include "nmx_port.h"
++
++/* IOLog (FBLOG) also goes to the flight recorder (xnu/nmx_flight.cpp) */
++extern "C" void nmx_flight_iolog(const char *fmt, ...) __printflike(1, 2);
++#define IOLog nmx_flight_iolog
+ 
+ extern "C" void nmx_trace(const char *what, long val);    /* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+ extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -26,6 +26,7 @@
+ 
+ /* bring-up checkpoints, off unless the boot argument nmxtrace is set (bsdcompat/src/nmx_trace.c) */
+ extern "C" void nmx_trace(const char *what, long val);
++extern "C" void nmx_flight_start(void);    /* xnu/nmx_flight.cpp */
+ #if __has_include("nmx_buildstamp.h")
+ #include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
+ #else
+@@ -285,6 +286,8 @@
+     nmx_trace("attach: waiting for the firmware folder", 0);
+     int err = nmx_xnu_wait_firmware_root(300);
+     nmx_trace("attach: firmware folder (err)", err);
++    /* the root file system is up: the flight recorder (nmxtrace) starts writing what it has buffered since load */
++    nmx_flight_start();
+     if (err) {
+         IOLog("NullMoth GPU: the firmware folder never appeared (%d); this GPU stays with macOS\n", err);
+         attach_ = -1;

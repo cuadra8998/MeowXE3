@@ -1,0 +1,81 @@
+diff --git a/src/intel/vulkan/anv_api_version.h b/src/intel/vulkan/anv_api_version.h
+index 3a5313e..dcf70e4 100644
+--- a/src/intel/vulkan/anv_api_version.h
++++ b/src/intel/vulkan/anv_api_version.h
+@@ -7,7 +7,8 @@
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) ||     \
+     defined(VK_USE_PLATFORM_XCB_KHR) || \
+     defined(VK_USE_PLATFORM_XLIB_KHR) || \
+-    defined(VK_USE_PLATFORM_DISPLAY_KHR)
++    defined(VK_USE_PLATFORM_DISPLAY_KHR) || \
++    defined(VK_USE_PLATFORM_METAL_EXT)
+ #define ANV_USE_WSI_PLATFORM
+ #endif
+ 
+diff --git a/src/intel/vulkan/anv_device.c b/src/intel/vulkan/anv_device.c
+index 7f37f9c..8839a36 100644
+--- a/src/intel/vulkan/anv_device.c
++++ b/src/intel/vulkan/anv_device.c
+@@ -1871,8 +1871,15 @@ VkResult anv_AllocateMemory(
+     * easy to catch those as Xe KMD driver will print warnings in dmesg when
+     * scanning buffers allocated without proper flag set.
+     */
++#ifndef __APPLE__
+    if (wsi_info)
+       alloc_flags |= ANV_BO_ALLOC_SCANOUT;
++#else
++   /* MeowXE3: on macOS a swapchain buffer is never scanned out by this GPU: the Metal WSI's software path reads it
++    * on the CPU and copies it into a CAMetalLayer drawable. xe refuses CPU-cached (WB) memory for scanout BOs, and the
++    * software path asks for cached memory, so with the flag every swapchain failed (VK_ERROR_OUT_OF_DEVICE_MEMORY). */
++   (void)wsi_info;
++#endif
+ 
+    struct anv_image *image = dedicated_info ?
+                              anv_image_from_handle(dedicated_info->image) :
+diff --git a/src/intel/vulkan/anv_instance.c b/src/intel/vulkan/anv_instance.c
+index c623279..6a4c294 100644
+--- a/src/intel/vulkan/anv_instance.c
++++ b/src/intel/vulkan/anv_instance.c
+@@ -76,6 +76,10 @@ static const struct vk_instance_extension_table instance_extensions = {
+ #ifndef VK_USE_PLATFORM_WIN32_KHR
+    .EXT_headless_surface                     = true,
+ #endif
++#ifdef VK_USE_PLATFORM_METAL_EXT
++   /* MeowXE3 (after HighDelay's NVK patch): macOS windows are CAMetalLayers */
++   .EXT_metal_surface                        = true,
++#endif
+ };
+ 
+ VkResult anv_EnumerateInstanceExtensionProperties(
+diff --git a/src/intel/vulkan/anv_wsi.c b/src/intel/vulkan/anv_wsi.c
+index 6caba7c..2ad5a68 100644
+--- a/src/intel/vulkan/anv_wsi.c
++++ b/src/intel/vulkan/anv_wsi.c
+@@ -50,7 +50,14 @@ anv_init_wsi(struct anv_physical_device *physical_device)
+                             physical_device->master_fd,
+                             &physical_device->drirc.options,
+                             &(struct wsi_device_options){
++#ifdef VK_USE_PLATFORM_METAL_EXT
++                               /* MeowXE3: the Metal swapchain's hardware path binds a drawable's texture to a
++                                * VkImage, which only a Metal-native driver can do; the software path renders into
++                                * a linear host-visible image that the layer helper copies into the drawable */
++                               .sw_device = true,
++#else
+                                .sw_device = false,
++#endif
+                                .emulate_24as32 = true,
+                             });
+    if (result != VK_SUCCESS)
+diff --git a/src/vulkan/meson.build b/src/vulkan/meson.build
+index a24d9d3..4f477df 100644
+--- a/src/vulkan/meson.build
++++ b/src/vulkan/meson.build
+@@ -73,7 +73,7 @@ if with_platform_macos
+   vulkan_wsi_list += '-DVK_USE_PLATFORM_METAL_EXT'
+   vulkan_wsi_deps += dependency(
+     'appleframeworks',
+-    modules : ['QuartzCore', 'Metal']
++    modules : ['QuartzCore', 'Metal', 'CoreGraphics']
+   )
+ endif
+ 

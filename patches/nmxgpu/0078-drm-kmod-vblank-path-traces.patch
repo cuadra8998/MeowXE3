@@ -1,0 +1,80 @@
+Subject: [PATCH 0078] drm-kmod: value traces on the vblank enable path (applied to drm-kmod, after 0076)
+
+For the flip whose vblank never came on Wildcat Lake: drm_vblank_get's refcount, enabled flag and result,
+intel_crtc_arm_vblank_event's vblank_get result, and in bdw_update_pipe_irq the pipe IMR value written - or, when the
+write is skipped because the cached mask (de_irq_mask) says nothing changes, the cached and the hardware value.
+Off unless the boot argument nmxtrace is set.
+
+diff --git a/drivers/gpu/drm/drm_vblank.c b/drivers/gpu/drm/drm_vblank.c
+--- a/drivers/gpu/drm/drm_vblank.c
++++ b/drivers/gpu/drm/drm_vblank.c
+@@ -24,6 +24,7 @@
+  * OTHER DEALINGS IN THE SOFTWARE.
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/export.h>
+ #include <linux/kthread.h>
+ #include <linux/moduleparam.h>
+@@ -1217,7 +1218,8 @@
+ 
+ 	spin_lock_irqsave(&dev->vbl_lock, irqflags);
+ 	/* Going from 0->1 means we have to enable interrupts again */
+-	if (atomic_add_return(1, &vblank->refcount) == 1) {
++	int nmx_ref = atomic_add_return(1, &vblank->refcount);
++	if (nmx_ref == 1) {
+ 		ret = drm_vblank_enable(dev, pipe);
+ 	} else {
+ 		if (!vblank->enabled) {
+@@ -1225,8 +1227,13 @@
+ 			ret = -EINVAL;
+ 		}
+ 	}
++	bool nmx_enabled = vblank->enabled;
+ 	spin_unlock_irqrestore(&dev->vbl_lock, irqflags);
+ 
++	/* NullMoth (nmxtrace): why a flip's vblank never came on Wildcat Lake */
++	nmx_trace("vblank: drm_vblank_get refcount", nmx_ref);
++	nmx_trace("vblank: drm_vblank_get enabled", nmx_enabled);
++	nmx_trace("vblank: drm_vblank_get (ret)", ret);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/gpu/drm/i915/display/intel_crtc.c b/drivers/gpu/drm/i915/display/intel_crtc.c
+--- a/drivers/gpu/drm/i915/display/intel_crtc.c
++++ b/drivers/gpu/drm/i915/display/intel_crtc.c
+@@ -2,6 +2,7 @@
+ /*
+  * Copyright © 2020 Intel Corporation
+  */
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/kernel.h>
+ #include <linux/pm_qos.h>
+ #include <linux/slab.h>
+@@ -621,7 +622,9 @@
+ 	if (!crtc_state->uapi.event)
+ 		return;
+ 
+-	drm_WARN_ON(crtc->base.dev, drm_crtc_vblank_get(&crtc->base) != 0);
++	int nmx_ret = drm_crtc_vblank_get(&crtc->base);
++	nmx_trace("vblank: arm event, vblank_get (ret)", nmx_ret);
++	drm_WARN_ON(crtc->base.dev, nmx_ret != 0);
+ 
+ 	spin_lock_irqsave(&crtc->base.dev->event_lock, irqflags);
+ 	drm_crtc_arm_vblank_event(&crtc->base, crtc_state->uapi.event);
+diff --git a/drivers/gpu/drm/i915/display/intel_display_irq.c b/drivers/gpu/drm/i915/display/intel_display_irq.c
+--- a/drivers/gpu/drm/i915/display/intel_display_irq.c
++++ b/drivers/gpu/drm/i915/display/intel_display_irq.c
+@@ -132,6 +132,12 @@
+ 		intel_uncore_write(&dev_priv->uncore, GEN8_DE_PIPE_IMR(pipe),
+ 				   dev_priv->display.irq.de_irq_mask[pipe]);
+ 		intel_uncore_posting_read(&dev_priv->uncore, GEN8_DE_PIPE_IMR(pipe));
++		nmx_trace("vblank: pipe IMR written", (long)new_val);
++	} else {
++		/* NullMoth (nmxtrace): the write is skipped when the cached mask says nothing changes; show the hardware */
++		nmx_trace("vblank: pipe IMR unchanged, cached", (long)new_val);
++		nmx_trace("vblank: pipe IMR unchanged, hardware",
++			  (long)intel_uncore_read(&dev_priv->uncore, GEN8_DE_PIPE_IMR(pipe)));
+ 	}
+ }
+ 

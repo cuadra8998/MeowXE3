@@ -1,0 +1,30 @@
+Subject: [PATCH 0082] framebuffer: set IOFBDependentID so IOGraphics creates the framebuffer's controller
+
+Wildcat Lake test 25: panic in IOFramebuffer::powerStateWillChangeTo (NULL+0x120, state 1, kIOPMDeviceUsable) right
+after NMXGPU's framebuffer registered its power driver. IOFramebuffer::start takes the framebuffer's IOFBController
+from IOFBController::copyController, which returns NULL unless the framebuffer has an IOFBDependentID (OSNumber)
+property; every IOGraphics path that takes the controller's gate then reads NULL->+0x120 (also test 24's
+IOFramebuffer::terminate). Set IOFBDependentID (the GPU's PCI registry ID) and IOFBDependentIndex 0 before
+IOFramebuffer::start, as the GPU framebuffer drivers do.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 6a08779..ba1ca69 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -84,6 +84,16 @@ public:
+     }
+ 
+     bool start(IOService *provider) override {
++        /*
++         * IOFramebuffer::start finds this framebuffer's IOFBController by the IOFBDependentID property (one controller
++         * per GPU; IOFBController::copyController returns NULL without it). With no controller every later IOGraphics
++         * call that takes the controller's gate dereferences NULL+0x120: the first power change after
++         * registerPowerDriver panicked in IOFramebuffer::powerStateWillChangeTo (test 25). Set it as the GPU drivers
++         * do, to the PCI device's registry ID, with this framebuffer's index on it.
++         */
++        IOService *pci = provider->getProvider() ? provider->getProvider() : provider;
++        setProperty("IOFBDependentID", pci->getRegistryEntryID(), 64);
++        setProperty("IOFBDependentIndex", 0ULL, 32);
+         nmx_trace("publish: start: IOFramebuffer::start", 0);
+         if (!IOFramebuffer::start(provider)) return false;
+         nmx_trace("publish: start: vblank timer (flags)", fFlags);

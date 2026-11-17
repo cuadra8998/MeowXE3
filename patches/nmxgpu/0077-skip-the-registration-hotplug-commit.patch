@@ -1,0 +1,61 @@
+Subject: [PATCH 0077] Display bridge: no second commit from the hotplug drm_client_register fires
+
+Wildcat Lake flight log (test start 20): NMXGPU's modeset lit the panel (link trained, pipe A on, backlight on), then
+drm_client_register() called bridge_hotplug(), which re-committed the configuration just committed. That plane-only
+flip waited for a vblank that never came (pipe A's vblank stayed masked in IMR), flip_done timed out after 10 s and
+the publish stalled. The hotplug that drm_client_register() fires synchronously is now skipped (nmx_fb_open() has just
+committed exactly that); hotplugs after registration re-commit as before.
+
+- override/src/nmx_fb_bridge.c: struct nmx_fb.registered, set after drm_client_register(); bridge_hotplug() returns
+  early before it (noted as "fb: hotplug during registration skipped"); nmx_trace declared before its first use.
+
+Applies on top of 0051-0075.
+
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -32,8 +32,11 @@
+     struct iosys_map map;
+     int mapped;
+     struct nmx_fb_info info;
++    int registered;     /* drm_client_register returned: hotplugs from here on are real */
+ };
+ 
++void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++
+ /* one bridge per PCI function the port drives */
+ #define MAX_FB 8
+ static struct { void *dev; struct nmx_fb *fb; } fbs[MAX_FB];
+@@ -81,6 +84,15 @@
+     struct drm_mode_set *ms;
+     if (fb->buffer == NULL)
+         return 0;
++    /*
++     * drm_client_register() calls this at once, for the configuration nmx_fb_open() has just committed: committing it
++     * again only queued a plane flip, and on Wildcat Lake that flip's vblank never came (flip_done timed out after 10 s,
++     * stalling the publish). Only hotplugs after registration (an output plugged or unplugged) re-commit.
++     */
++    if (!fb->registered) {
++        nmx_trace("fb: hotplug during registration skipped", 0);
++        return 0;
++    }
+     if (drm_client_modeset_probe(client, fb->info.width, fb->info.height) != 0)
+         return 0;
+     mutex_lock(&client->modeset_mutex);
+@@ -132,8 +144,6 @@
+     kfree(fb);
+ }
+ 
+-void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+-
+ /* debug (nullmoth-fbstop=2, set by xnu/nmx_fb.cpp): everything but the modeset commit */
+ int nmx_fb_skip_commit;
+ 
+@@ -251,6 +261,7 @@
+     }
+     nmx_trace("fb: drm_client_register", 0);
+     drm_client_register(&fb->client);       /* from here on hotplug reaches bridge_hotplug */
++    fb->registered = 1;
+ 
+     fb->info = *out;
+     fbs[slot].dev = dev;

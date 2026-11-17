@@ -1,0 +1,146 @@
+From 1ab1928b674df8932612dd0bd96666a58537a85d Mon Sep 17 00:00:00 2001
+From: MeowXE3 <meowxe3@localhost>
+Date: Tue, 17 Nov 2026 03:06:16 -0800
+Subject: [PATCH 59/60] plugin: put back the app sampler a shader's own sampler
+ displaced (NullMoth bde9fc9, #363 dock blur blocks)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLEmbedded.m | 24 ++++++++++++---------
+ plugin/nvmtl_vk.c      | 47 +++++++++++++++++++++++++++++++++++++++++-
+ plugin/nvmtl_vk.h      |  2 ++
+ 3 files changed, 62 insertions(+), 11 deletions(-)
+
+diff --git a/plugin/NVMTLEmbedded.m b/plugin/NVMTLEmbedded.m
+index 86472d7..73cbb40 100644
+--- a/plugin/NVMTLEmbedded.m
++++ b/plugin/NVMTLEmbedded.m
+@@ -201,7 +201,7 @@ static BOOL nvmtl_embedded_info_due(_Atomic uint64_t *counter) {
+ }
+ static _Atomic uint64_t nvmtl_embedded_empty_count, nvmtl_embedded_bound_count;
+ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint32_t slot, BOOL sampler) {
+-    if (sampler) nvmtl_vk_bind_sampler(&cb->_c, set, slot, NULL);
++    if (sampler) nvmtl_vk_bind_parked_sampler(&cb->_c, set, slot, NULL);
+     else {
+         nvmtl_vk_bind_texture_view(&cb->_c, set, slot, NULL);
+         nvmtl_vk_bind_storage_view(&cb->_c, set, slot, NULL);
+@@ -210,15 +210,19 @@ static void nvmtl_clear_embedded_slot(NVMTLCommandBuffer *cb, uint32_t set, uint
+ void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn, NSDictionary *bufferAtIndex)
+ {
+     if (!cb || !fn) return;
+-    if (nvmtl_static_samplers_on()) {
+-        for (NSArray *pair in nvmtl_static_samplers(fn)) {
+-            NVMTLSamplerState *s = pair[1];
+-            nvmtl_retain_resource(cb, s);
+-            if (nvmtl_vk_bind_sampler(&cb->_c, set, [pair[0] unsignedIntValue], &s->_s))
+-                nvlog("static sampler slot %@: bind FAILED", pair[0]);
+-        }
+-    }
++    NSArray<NSArray *> *statics = nvmtl_static_samplers_on() ? nvmtl_static_samplers(fn) : nil;
+     NSArray<NVMTLEmbeddedPlan *> *embedded = nvmtl_embedded_plan(fn);
++    // give the app back any sampler slot an earlier shader parked its own sampler in and this one leaves alone
++    uint32_t keep = 0;
++    for (NSArray *pair in statics) { uint32_t i = [pair[0] unsignedIntValue]; if (i < 32) keep |= 1u << i; }
++    for (NVMTLEmbeddedPlan *plan in embedded) if (plan->wantSampler && plan->slot < 32) keep |= 1u << plan->slot;
++    nvmtl_vk_parked_samplers_keep(&cb->_c, set, keep);
++    for (NSArray *pair in statics) {
++        NVMTLSamplerState *s = pair[1];
++        nvmtl_retain_resource(cb, s);
++        if (nvmtl_vk_bind_parked_sampler(&cb->_c, set, [pair[0] unsignedIntValue], &s->_s))
++            nvlog("static sampler slot %@: bind FAILED", pair[0]);
++    }
+     if (!embedded.count) return;
+     extern int nvmtl_vk_emb_same(nvk_cmdbuf *, uint32_t, const void *, const uint64_t *, uint32_t);
+     extern void nvmtl_vk_emb_note(nvk_cmdbuf *, uint32_t, const void *, const uint64_t *, uint32_t);
+@@ -288,7 +292,7 @@ void nvmtl_bind_embedded(NVMTLCommandBuffer *cb, uint32_t set, NVMTLFunction *fn
+         if (wantSampler) {
+             NVMTLSamplerState *s = resource;
+             nvmtl_retain_resource(cb, s);
+-            if (nvmtl_vk_bind_sampler(&cb->_c, set, slot, &s->_s))
++            if (nvmtl_vk_bind_parked_sampler(&cb->_c, set, slot, &s->_s))
+                 nvlog("embedded sampler slot %u: bind FAILED", slot);
+         } else {
+             NVMTLTexture *t = resource;
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index c4f561d..e647d6a 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -2052,7 +2052,10 @@ static int nvmtl_dirty_only_on(void)
+ typedef struct { nvmtl_slot s[2][NVMTL_NBIND];
+                  uint8_t dirty[2]; VkDescriptorSet last[2]; unsigned last_idx[2]; uint32_t last_hi[2]; uint64_t lastw[2][4];
+                  uint64_t chg[2][4]; uint64_t texgen[2]; const void *emb_fn[2]; uint64_t emb_gen[2]; uint32_t emb_n[2];
+-                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX]; } nvmtl_bindtable;
++                 uint64_t emb_key[2][NVMTL_EMB_KEYMAX];
++                 /* samplers a shader brought itself, parked in sampler slots it leaves free, and what each displaced */
++                 uint32_t park_mask[2]; uint8_t park_kind[2][NVMTL_NSAMP], park_saved_kind[2][NVMTL_NSAMP];
++                 void *park_h[2][NVMTL_NSAMP], *park_saved[2][NVMTL_NSAMP]; } nvmtl_bindtable;
+ 
+ static VkDescriptorSetLayout g_setLayout;
+ #define NVMTL_MAX_POOLS 64
+@@ -2971,8 +2974,50 @@ int nvmtl_vk_bind_texture(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_image
+ int nvmtl_vk_bind_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s)
+ {
+     if (index >= NVMTL_NSAMP) { nvlog("bind sampler: index %u is outside [0,%d)", index, NVMTL_NSAMP); return -1; }
++    // the app set this slot itself, so a sampler parked here has nothing to hand back
++    if (set <= 1 && c->table) ((nvmtl_bindtable *)c->table)->park_mask[set] &= ~(1u << index);
+     return nvmtl_bind_slot(c, set, NVMTL_NBUF + NVMTL_NTEX + index, s ? NVMTL_SLOT_SAMP : NVMTL_SLOT_NONE, s ? s->s : NULL, 0);
+ }
++/* Metal keeps an app's sampler in its slot while a shader with its own constexpr or argument-buffer sampler draws. Vulkan
++   has no such samplers, so the translator parks them in slots the shader leaves free. Keep what each one displaced and put
++   it back once a shader no longer needs the slot: Core Animation binds a linear sampler once, then its Dock upscale read a
++   parked nearest sampler and drew 32x32 blocks (#363). NVMTL_NO_SAMPLER_RESTORE=1 keeps the old behaviour. */
++static int nvmtl_sampler_restore_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char *e = getenv("NVMTL_NO_SAMPLER_RESTORE"); on = !(e && *e && *e != '0');
++        nvlog("vk: app samplers displaced by a shader's own sampler are %s (NVMTL_NO_SAMPLER_RESTORE=%s)", on ? "put back" : "left overwritten (OLD)", e ? e : "unset"); }
++    return on;
++}
++int nvmtl_vk_bind_parked_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s)
++{
++    if (!nvmtl_sampler_restore_on()) return nvmtl_vk_bind_sampler(c, set, index, s);
++    if (index >= NVMTL_NSAMP || set > 1) { nvlog("bind parked sampler: index %u set %u out of range", index, set); return -1; }
++    const uint32_t b = NVMTL_NBUF + NVMTL_NTEX + index, bit = 1u << index;
++    nvmtl_bindtable *t = (nvmtl_bindtable *)c->table;
++    const uint8_t kind = t ? t->s[set][b].kind : NVMTL_SLOT_NONE;
++    void *h = t ? t->s[set][b].h : NULL;
++    const int parked = t && (t->park_mask[set] & bit) && kind == t->park_kind[set][index] && h == t->park_h[set][index];
++    int r = nvmtl_bind_slot(c, set, b, s ? NVMTL_SLOT_SAMP : NVMTL_SLOT_NONE, s ? s->s : NULL, 0);
++    if (r) return r;
++    t = (nvmtl_bindtable *)c->table;
++    if (!parked) { t->park_saved_kind[set][index] = kind; t->park_saved[set][index] = h; }
++    t->park_kind[set][index] = t->s[set][b].kind; t->park_h[set][index] = t->s[set][b].h;
++    t->park_mask[set] |= bit;
++    return 0;
++}
++void nvmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep)
++{
++    nvmtl_bindtable *t = c ? (nvmtl_bindtable *)c->table : NULL;
++    if (!t || set > 1) return;
++    for (uint32_t drop = t->park_mask[set] & ~keep; drop; drop &= drop - 1) {
++        const uint32_t i = (uint32_t)__builtin_ctz(drop), b = NVMTL_NBUF + NVMTL_NTEX + i;
++        const nvmtl_slot *sl = &t->s[set][b];
++        if (sl->kind == t->park_kind[set][i] && sl->h == t->park_h[set][i])
++            nvmtl_bind_slot(c, set, b, t->park_saved_kind[set][i], t->park_saved[set][i], 0);
++        t->park_mask[set] &= ~(1u << i);
++    }
++}
+ 
+ int nvmtl_vk_sample_positions_backend(void) { return nvmtl_vk_init() == 0 && g_sample_locations; }
+ int nvmtl_vk_sample_positions_default(uint32_t count, nvmtl_sample_pattern *out)
+diff --git a/plugin/nvmtl_vk.h b/plugin/nvmtl_vk.h
+index f90960c..45bf12d 100644
+--- a/plugin/nvmtl_vk.h
++++ b/plugin/nvmtl_vk.h
+@@ -164,6 +164,8 @@ int  nvmtl_vk_sampler_create(int linear, int repeat, nvk_sampler *out);
+ int  nvmtl_vk_sampler_create_desc(const nvmtl_sampler_desc *desc, nvk_sampler *out);
+ void nvmtl_vk_sampler_destroy(nvk_sampler *s);
+ int  nvmtl_vk_bind_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
++int  nvmtl_vk_bind_parked_sampler(nvk_cmdbuf *c, uint32_t set, uint32_t index, nvk_sampler *s);
++void nvmtl_vk_parked_samplers_keep(nvk_cmdbuf *c, uint32_t set, uint32_t keep);
+ void nvmtl_vk_cmd_bind_set(nvk_cmdbuf *c, nvk_pipeline *p);
+ int  nvmtl_vk_compute_pipeline_create(const void *cs, size_t n, nvk_pipeline *out);
+ void nvmtl_vk_cmd_dispatch(nvk_cmdbuf *c, nvk_pipeline *p, uint32_t gx, uint32_t gy, uint32_t gz);
+-- 
+2.50.1 (Apple Git-155)
+

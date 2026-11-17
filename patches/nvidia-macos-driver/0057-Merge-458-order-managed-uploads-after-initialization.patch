@@ -1,0 +1,37 @@
+From e79dde80c8a3217e15ac5114b11df6804fdb7b19 Mon Sep 17 00:00:00 2001
+From: NullMoth Systems <noreply@nullmothsystems.com>
+Date: Sat, 31 Oct 2026 15:46:26 -0700
+Subject: [PATCH 57/60] Merge #458: order managed uploads after initialization
+ clears
+
+(cherry picked from commit f3c55cabc9de1f72608f0a0c723c5e4bb8e8a906)
+---
+ plugin/NVMTLObjects.m | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 26dfe09..12cca66 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -599,6 +599,7 @@ static void nvmtl_purge_report(const char *why) {
+           (unsigned long long)atomic_load(&gPurgeAsks), (unsigned long long)(bemp >> 20));
+ }
+ static void nvmtl_pre_release(void *held) { @autoreleasepool { (void)CFBridgingRelease(held); } }
++static void nvmtl_zero_flush(void);
+ static void nvmtl_managed_flush(void) {
+     if (!atomic_load(&gManagedAny) || gManagedInFlush) return;
+     gManagedInFlush = 1;
+@@ -610,6 +611,10 @@ static void nvmtl_managed_flush(void) {
+     }
+     [gManagedDirty removeAllObjects]; atomic_store(&gManagedAny, 0);
+     os_unfair_lock_unlock(&gManagedLock);
++    // A managed buffer can be created and dirtied after presubmit's first zero
++    // snapshot. Claim its initial clear before uploading this dirty snapshot;
++    // otherwise the next submission can clear data already uploaded here.
++    if (todo.count) nvmtl_zero_flush();
+     if (todo.count && nvmtl_vk_pre_open()) {
+         for (NSArray *t in todo) {
+             NVMTLBuffer *b = t[0]; NSUInteger lo = [t[1] unsignedIntegerValue], n = [t[2] unsignedIntegerValue] - lo;
+-- 
+2.50.1 (Apple Git-155)
+

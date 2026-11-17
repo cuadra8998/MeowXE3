@@ -1,0 +1,81 @@
+Subject: [PATCH 0090] display: skip a power request for the current state; shutdown breadcrumbs
+
+Wildcat Lake test 36 (the first start with macOS on NMXGPU's framebuffer): IOGraphics' power-on right after
+WindowServer's open asked for outputs already on; the commit changed nothing on the pipe, nothing armed its
+completion event, and DRM waited its full timeout ("[CRTC:82:pipe A] flip_done timed out", 10 s). Shutdown stalled
+on test starts; the same waits are the likely cause.
+- override/src/nmx_fb_bridge.c: nmx_fb_power tracks whether the outputs are lit (on after the open) and returns at
+  once for a request for that state.
+- xnu/nmx_kext.cpp: "attach:" breadcrumbs (NVRAM) through systemWillShutdown and xe's shutdown, and after
+  setPowerState's suspend/resume, so a shutdown that still stalls names its step at the next start.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 6c33b1e..39133f0 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -600,15 +600,22 @@ IOReturn NMXGPU::setPowerState(unsigned long state, IOService *device)
+         if (err)
+             IOLog("NullMoth GPU: %s returned %d\n", on ? "resume" : "suspend", err);
+         suspended_ = !on;
++        nmx_trace("attach: NMXGPU setPowerState done (err)", (long)err);
+     }
+     return kIOPMAckImplied;
+ }
+ 
+ void NMXGPU::systemWillShutdown(IOOptionBits spec)
+ {
+-    if (dev_ != nullptr)
++    /* "attach:" breadcrumbs (NVRAM, synced): a shutdown that stalls leaves the last step for the next start */
++    nmx_trace("attach: shutdown: systemWillShutdown (spec)", (long)spec);
++    if (dev_ != nullptr) {
++        nmx_trace("attach: shutdown: xe shutdown", 0);
+         nmx_port_shutdown(dev_);
++        nmx_trace("attach: shutdown: xe shutdown done", 0);
++    }
+     IOService::systemWillShutdown(spec);
++    nmx_trace("attach: shutdown: acknowledged", 0);
+ }
+ 
+ /* ---- module start/stop: the stop refuses while device nodes are open ------------------------------------------------- */
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+index 877cbef..46bac12 100644
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -33,6 +33,7 @@ struct nmx_fb {
+     int mapped;
+     struct nmx_fb_info info;
+     int registered;     /* drm_client_register returned: hotplugs from here on are real */
++    int dpms_on;        /* outputs lit (the open leaves them on); nmx_fb_power skips a request for the current state */
+ };
+ 
+ void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+@@ -262,6 +263,7 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
+     nmx_trace("fb: drm_client_register", 0);
+     drm_client_register(&fb->client);       /* from here on hotplug reaches bridge_hotplug */
+     fb->registered = 1;
++    fb->dpms_on = 1;                        /* the commit above (or, with fbstop=2, xe's own takeover) lit the outputs */
+ 
+     fb->info = *out;
+     fbs[slot].dev = dev;
+@@ -293,9 +295,21 @@ int nmx_fb_power(void *dev, int on)
+ {
+     for (int i = 0; i < MAX_FB; i++)
+         if (fbs[i].dev == dev) {
++            /*
++             * A request for the state the outputs are already in commits nothing on the pipe, so nothing arms the
++             * commit's completion event and DRM waits its full flip_done timeout: IOGraphics' power-on right after
++             * WindowServer's open took 10 s ("[CRTC:82:pipe A] flip_done timed out", Wildcat Lake test 36), and the
++             * same waits stack up at shutdown. Skipped, as the redundant hotplug flip is (bridge_hotplug).
++             */
++            if (!!on == fbs[i].fb->dpms_on) {
++                nmx_trace("fb: power (already in that state)", on);
++                return 0;
++            }
+             nmx_trace("fb: power (on)", on);
+             int err = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
+             nmx_trace("fb: power done (err)", err);
++            if (err == 0)
++                fbs[i].fb->dpms_on = !!on;
+             return err;
+         }
+     return ENODEV;

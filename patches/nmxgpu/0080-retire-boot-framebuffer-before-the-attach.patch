@@ -1,0 +1,130 @@
+Subject: [PATCH 0080] nullmoth-fbflags 0x10: retire the boot framebuffer before the GPU goes to xe; PCI command logged
+
+Wildcat Lake test starts 21-23 (flight log + breadcrumbs): with the framebuffer's power driver skipped and the boot
+framebuffer kept (fbflags 0xC) the start ran on (publish done, heartbeat to t=60) but IOGraphics never opened the
+framebuffer; retiring IONDRVFramebuffer after the publish (fbflags 0x4) or registering the framebuffer's power driver
+while it was still there (fbflags 0x8) froze the Mac within ~0.1 s. Both involve the firmware's boot framebuffer on
+the same GPU changing state once xe drives it.
+
+- xnu/nmx_fb.cpp: nmx_fb_retire_boot_early() terminates IONDRVFramebuffer and waits (waitQuiet on the PCI device, up to
+  3 s) for the teardown; with 0x10 the publish skips its own retirement.
+- xnu/nmx_kext.cpp: with nullmoth-fbflags 0x10, right after the boot guard is set and before the GPU is offered to the
+  drivers: retire it, log the PCI command register, re-enable memory decoding and bus mastering, log it again.
+- xnu/nmx_pci.cpp: the heartbeat logs the PCI command and status registers.
+
+Applies on top of 0051-0079.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -25,9 +25,10 @@
+  * Bring-up bisection of the freeze that follows IOFramebuffer::start on Wildcat Lake (the display itself runs fine:
+  * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
+  * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer,
+- * 0x8 = keep the firmware's boot framebuffer (as -nmxkeepndrv).
++ * 0x8 = keep the firmware's boot framebuffer (as -nmxkeepndrv), 0x10 = retire it before the GPU is offered to the
++ * drivers instead of after the publish (xnu/nmx_kext.cpp).
+  */
+-enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8 };
++enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8, kFbRetireEarly = 0x10 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -256,12 +257,16 @@
+  * has freed (an integrated GPU's stolen memory). Retire it the way a removed display goes away. Boot argument
+  * -nmxkeepndrv keeps it.
+  */
+-static void retire_boot_framebuffer(IOService *gpu, IOService *mine)
++static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early = false)
+ {
+     int dummy = 0;
+     if (PE_parse_boot_argn("-nmxkeepndrv", &dummy, sizeof(dummy)))
+         return;
+-    if (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbKeepBootFb) {
++    if (!early && (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbRetireEarly)) {
++        nmx_trace("publish: retire: already done before the attach (nullmoth-fbflags 0x10)", 0);
++        return;
++    }
++    if (!early && (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbKeepBootFb)) {
+         FBLOG("nullmoth-fbflags 0x8: keeping the boot framebuffer");
+         nmx_trace("publish: retire: kept (nullmoth-fbflags 0x8)", 0);
+         return;
+@@ -291,8 +296,23 @@
+         nmx_trace("publish: retire: terminate returned", (long)i);
+     }
+     victims->release();
++    if (early) {
++        /* let the termination finish (IONDRVFramebuffer's stop) before the GPU is handed to the drivers */
++        uint64_t ns = 3000000000ULL;
++        nmx_trace("publish: retire: waiting for the PCI device to go quiet (ret)", (long)pci->waitQuiet(ns));
++    }
+ }
+ 
++/*
++ * nullmoth-fbflags 0x10 (bring-up): retire the firmware's boot framebuffer before the GPU goes to xe. On Wildcat Lake
++ * retiring it after the publish froze the Mac, and so did the new framebuffer's power registration while it was still
++ * there; whatever IONDRVFramebuffer's teardown does to the PCI device then happens before xe depends on it.
++ */
++void nmx_fb_retire_boot_early(IOService *gpu)
++{
++    retire_boot_framebuffer(gpu, nullptr, true);
++}
++
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
+ extern "C" int nmx_fb_skip_commit;                     /* override/src/nmx_fb_bridge.c */
+ 
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -38,6 +38,7 @@
+ 
+ /* the display bridge (nmx_fb.cpp) */
+ IOService *nmx_fb_publish(IOService *gpu, void *dev);
++void nmx_fb_retire_boot_early(IOService *gpu);     /* xnu/nmx_fb.cpp */
+ void nmx_fb_unpublish(IOService *fb, IOService *gpu, void *dev);
+ 
+ class NMXGPU : public IOService {
+@@ -302,6 +303,14 @@
+         return;
+     }
+     nmx_marker_write(true);
++    if (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x10) {
++        nmx_trace("attach: retiring the boot framebuffer before the drivers (nullmoth-fbflags 0x10)", 0);
++        nmx_fb_retire_boot_early(this);
++        nmx_trace("attach: PCI command after the retirement", pci_->configRead16(kIOPCIConfigCommand));
++        pci_->setMemoryEnable(true);
++        pci_->setBusMasterEnable(true);
++        nmx_trace("attach: PCI command re-enabled", pci_->configRead16(kIOPCIConfigCommand));
++    }
+     nmx_trace("attach: boot guard set, offering the GPU to the drivers", 0);
+     dev_ = nmx_port_attach(pci_);
+     nmx_trace("attach: drivers returned (attached)", dev_ != nullptr);
+diff --git a/gpu-port/xkpi/xnu/nmx_pci.cpp b/gpu-port/xkpi/xnu/nmx_pci.cpp
+--- a/gpu-port/xkpi/xnu/nmx_pci.cpp
++++ b/gpu-port/xkpi/xnu/nmx_pci.cpp
+@@ -194,6 +194,7 @@
+     uint32_t winCount, lastRate;
+     bool stormed;
+     thread_call_t hb;
++    IOPCIDevice *pci;       /* for the heartbeat's config-space line */
+     uint32_t hbTicks;
+     bool initIrq() { delivered = 0; done = 0; winStart = 0; winCount = lastRate = 0; stormed = false; hb = nullptr; hbTicks = 0; return init(); }
+ };
+@@ -213,6 +214,9 @@
+     snprintf(note, sizeof(note), "t=%u irqs=%d done=%d rate=%u%s", irq->hbTicks * 2, irq->delivered, irq->done,
+              irq->lastRate, irq->stormed ? " storm-guard-tripped" : "");
+     IOLog("NullMoth GPU: heartbeat %s\n", note);
++    if (irq->pci)
++        IOLog("NullMoth GPU: pci command 0x%04x status 0x%04x\n", irq->pci->configRead16(kIOPCIConfigCommand),
++              irq->pci->configRead16(kIOPCIConfigStatus));
+     if (nmx_irq_state_hook) {
+         char regs[256];
+         if (nmx_irq_state_hook(regs, sizeof(regs)) > 0)
+@@ -332,6 +336,7 @@
+     }
+     irq->handler = handler;
+     irq->arg = arg;
++    irq->pci = d;
+     irq->wl = IOWorkLoop::workLoop();
+     if (irq->wl == nullptr) {
+         irq->release();

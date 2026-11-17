@@ -1,0 +1,61 @@
+From a0ce1a7ac56249a26a1583fd0b296fe112adc2a0 Mon Sep 17 00:00:00 2001
+From: nmx <nmx@local>
+Date: Sun, 15 Nov 2026 22:23:09 -0800
+Subject: [PATCH] NMXAccel: NMXGPU's panel copies each finished frame once
+ (ordered flips and the front re-copy off)
+
+Wildcat Lake: frames reach NMXGPU's panel by copy, and nothing ordered that copy after the GPU. With
+debug.nmxfb_blob_ordered=1 the Metal plugin let WindowServer present a surface once its command buffer was scheduled,
+so the copy took unfinished frames (typed characters showed a frame late) and the 60 Hz front-buffer re-copy that
+caught up with them tore. When NMXIntelGPUFB publishes, both are off: WindowServer waits for the pixels before it
+presents, and each frame is copied once. Tested live with the two sysctls: the glitching was gone, 51 fps.
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index f1f1dcf..c42f099 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -64,7 +64,8 @@ static int gNvAccelArmed = 0;
+ // a headless GPU hands frames to another GPU's WindowServer through system memory, so IOSurfaces must be copied out.
+ static int gNvHeadless = 0;
+ #ifdef NMX_ACCEL
+-static bool gNmxVmDisplay = false;   // NMXVGAFB (a VM's display) is published: it becomes head 0 of this accelerator
++static bool gNmxVmDisplay = false;
++static void nmxPanelDefaults();   // NMXGPU's panel (NMXIntelGPUFB): copy finished frames once (below)   // NMXVGAFB (a VM's display) is published: it becomes head 0 of this accelerator
+ class NVAccel;
+ static void nmxVmDisplayPublished(NVAccel *a);
+ static volatile UInt32 gNmxPhase1Done = 0, gNmxPhase2Done = 0;   // VM display arming (see nmxArmPhase1)
+@@ -289,6 +290,7 @@ public:
+             me->removeProperty("NMXAccelHeadless");
+             nmxInstallVmSysctls();
+             ALOG("VM display NMXVGAFB published: not headless; arming its display for WindowServer");
++            if (newService->metaCast("NMXIntelGPUFB")) nmxPanelDefaults();
+         }
+ #endif
+         unsigned idx = 0;
+@@ -1421,6 +1423,20 @@ SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobS
+ NVACCEL_CNT(nmxfb_blob_flips, gCntNmxBlobFlips, "VM display: frames scanned out of their surface (no copy)");
+ NVACCEL_CNT(nmxfb_blob_refused, gCntNmxBlobRefused, "VM display: surfaces the framebuffer would not scan out (copied instead)");
+ static int gNmxBlobOrdered = 1;
++/*
++ * NMXGPU's panel (NMXIntelGPUFB, Wildcat Lake): frames reach the panel by copy, and nothing orders that copy after the
++ * GPU (the ordered path waits for NMXPublished only on the VM display's blob flips). With ordered flips on, the Metal
++ * plugin let WindowServer present a surface as soon as its command buffer was scheduled, so the copy took frames the
++ * GPU had not finished (typed characters showed a frame late) and the 60 Hz front-buffer re-copy that caught up with
++ * them tore. Off: WindowServer waits for the pixels before it presents (NVMTLCommandBuffer
++ * commitAndWaitUntilSubmitted), each frame is copied once, complete. Measured: no tearing or late characters, 51 fps.
++ */
++static void nmxPanelDefaults()
++{
++    gNmxBlobOrdered = 0;
++    gNmxFrontHz = 0;
++    ALOG("NMXGPU panel: ordered flips off, front-buffer re-copy off (each finished frame is copied once)");
++}
+ static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs;
+ SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob_ordered, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobOrdered, 0,
+            "VM display: 1 = a presented surface goes on the panel once its pixels are in its memory (the flip waits on a "
+-- 
+2.50.1 (Apple Git-155)
+

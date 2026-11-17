@@ -1,0 +1,284 @@
+Subject: [PATCH 0095] framebuffer: accelerated-head mode (nullmoth-fbflags 0x200) for NMXAccel's GPU compositing
+
+The panel framebuffer as NMXAccel's head 0, following ericek111's NMXVGAFB contract (vibe-nullmoth-xe3-qemu part 4)
+on the real Intel display engine, opt-in: class NMXIntelGPUFB (vendor-named for CoreDisplay's IOPresentment; the
+NMXAccel built with ericek's patches + 0048 watches for it), IOFBDependentID 0x4E4D58560000001 / index 0,
+IOFBMemorySize 1 GB, built-in; nvAllocVram/nvFreeVram from contiguous system memory (4 slots reserved at start);
+nvScanoutInfo with the live scan-out's real physical address (stolen memory); NMXVGAFBOpen and nmxHeadOpened when
+WindowServer opens it; NMXGPU's display hold kept after the publish and released by the accelerator's
+nmxDisplayReady (30 s cap as before). Without 0x200 nothing changes.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 383b370..8816562 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -12,6 +12,7 @@
+ #include <pexpert/pexpert.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <IOKit/IODeviceMemory.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/pci/IOPCIDevice.h>
+ #include <kern/thread_call.h>
+ #include "nmx_port.h"
+@@ -33,11 +34,104 @@ extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
+  * panicked on NULL in fbNotificationOccurred (test 29).
+  */
+ enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8, kFbRetireEarly = 0x10,
+-       kFbIOGraphicsPower = 0x20, kFbRetireBeforeStart = 0x40 };
+-
++       kFbIOGraphicsPower = 0x20, kFbRetireBeforeStart = 0x40, kFbAccelHead = 0x200 };
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+ 
++/*
++ * nullmoth-fbflags 0x200 (bring-up): the panel framebuffer is NMXAccel's head 0, so WindowServer composites on the GPU
++ * (ericek111's NMXVGAFB contract, vibe-nullmoth-xe3-qemu part 4, on a real Intel display engine): class NMXIntelGPUFB
++ * (CoreDisplay's IOPresentment wants the vendor in the class name; NMXAccel watches for it), head-0 properties, the
++ * VRAM grants of nvrm_vram_abi.h (contiguous system memory for WindowServer's display surfaces), the live scan-out in
++ * stolen memory, NMXVGAFBOpen + nmxHeadOpened when WindowServer opens it, and NMXGPU's display hold released by the
++ * accelerator's nmxDisplayReady (xnu/nmx_kext.cpp) instead of at the publish.
++ */
++#define NVRM_VRAM_ABI_VERSION 2u
++struct NVRMVramRequest {
++    unsigned int version, flags;
++    unsigned long long size, actualSize, phys;
++    void *kva, *handle;
++    unsigned long long mappedTotal;
++    unsigned int width, height, pitch;
++    unsigned long long allocationCookie;
++};
++extern "C++" void nmx_gpu_accel_armed(IOService *gpu);   /* xnu/nmx_kext.cpp: releases the display hold */
++
++static constexpr unsigned kVramSlots = 4;                   /* WindowServer's three display surfaces and a spare */
++static constexpr unsigned long long kVramBudget = 512ull << 20;
++static IOBufferMemoryDescriptor *gVramSlot[kVramSlots];
++static volatile UInt32 gVramSlotBusy = 0;
++static unsigned long long gVramSlotBytes = 0;
++static IOLock *gVramLock = nullptr;
++static volatile SInt64 gVramUsed = 0, gVramCookie = 0;
++
++/* reserved at start, while memory is unfragmented (ericek111's 0046: a late 20 MB contiguous run was not found) */
++static void nmxVramReserve(unsigned long long slotBytes)
++{
++    if (!gVramLock && !(gVramLock = IOLockAlloc())) return;
++    IOLockLock(gVramLock);
++    if (!gVramSlotBytes) {
++        unsigned n = 0;
++        for (; n < kVramSlots; n++)
++            if (!(gVramSlot[n] = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++                      kIODirectionInOut | kIOMemoryPhysicallyContiguous, slotBytes, 0x000000FFFFFFF000ull))) break;
++        if (n) gVramSlotBytes = slotBytes;
++        for (unsigned i = n; i < kVramSlots; i++) gVramSlotBusy |= 1u << i;
++        FBLOG("VRAM: %u of %u slots of %llu bytes reserved", n, kVramSlots, slotBytes);
++    }
++    IOLockUnlock(gVramLock);
++}
++
++static IOReturn nmxVramAlloc(NVRMVramRequest *r)
++{
++    const unsigned long long want = (r->size + PAGE_SIZE - 1) & ~(unsigned long long)(PAGE_SIZE - 1);
++    if (!want) return kIOReturnBadArgument;
++    if ((unsigned long long)OSAddAtomic64((SInt64)want, &gVramUsed) + want > kVramBudget) {
++        OSAddAtomic64(-(SInt64)want, &gVramUsed);
++        FBLOG("nvAllocVram(%llu): refused, budget spent", want);
++        return kIOReturnNoSpace;
++    }
++    IOBufferMemoryDescriptor *b = nullptr;
++    if (gVramLock && want <= gVramSlotBytes) {
++        IOLockLock(gVramLock);
++        for (unsigned i = 0; i < kVramSlots && !b; i++)
++            if (!(gVramSlotBusy & (1u << i))) { gVramSlotBusy |= 1u << i; b = gVramSlot[i]; b->retain(); }
++        IOLockUnlock(gVramLock);
++    }
++    if (!b) b = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous, want, 0x000000FFFFFFF000ull);
++    if (!b) {
++        OSAddAtomic64(-(SInt64)want, &gVramUsed);
++        FBLOG("nvAllocVram(%llu): no contiguous system memory", want);
++        return kIOReturnNoMemory;
++    }
++    bzero(b->getBytesNoCopy(), want);
++    r->handle = b; r->kva = b->getBytesNoCopy();
++    r->phys = b->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone);
++    r->actualSize = want;
++    r->mappedTotal = (unsigned long long)gVramUsed;
++    r->allocationCookie = (unsigned long long)OSAddAtomic64(1, &gVramCookie) + 1;
++    nmx_trace("publish: accel: nvAllocVram (KB)", (long)(want >> 10));
++    return kIOReturnSuccess;
++}
++
++static IOReturn nmxVramFree(NVRMVramRequest *r)
++{
++    IOBufferMemoryDescriptor *b = OSDynamicCast(IOBufferMemoryDescriptor, (OSObject *)r->handle);
++    if (!b) return kIOReturnBadArgument;
++    OSAddAtomic64(-(SInt64)(r->actualSize ? r->actualSize : b->getLength()), &gVramUsed);
++    if (gVramLock) {
++        IOLockLock(gVramLock);
++        for (unsigned i = 0; i < kVramSlots; i++) if (gVramSlot[i] == b) gVramSlotBusy &= ~(1u << i);
++        IOLockUnlock(gVramLock);
++    }
++    b->release();
++    r->handle = nullptr; r->kva = nullptr; r->phys = 0; r->actualSize = 0; r->allocationCookie = 0;
++    return kIOReturnSuccess;
++}
++
++
++
+ static IOPMPowerState kFbPowerStates[2] = {
+     { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+     { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+@@ -68,6 +162,8 @@ class NMXGPUFB : public IOFramebuffer {
+     uint64_t fVblNext = 0;
+     volatile bool fStopping = false;
+     int fFlags = 0;
++    IOService *fAccel = nullptr;            /* 0x200: the accelerator that armed this head (retained) */
++    volatile UInt32 fOpenedOnce = 0;
+ 
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         NMXGPUFB *me = (NMXGPUFB *)p0;
+@@ -110,8 +206,19 @@ public:
+          * do, to the PCI device's registry ID, with this framebuffer's index on it.
+          */
+         IOService *pci = provider->getProvider() ? provider->getProvider() : provider;
+-        setProperty("IOFBDependentID", pci->getRegistryEntryID(), 64);
+-        setProperty("IOFBDependentIndex", 0ULL, 32);
++        if (fFlags & kFbAccelHead) {
++            /* head 0 of NMXAccel, as ericek111's NMXVGAFB: the accelerator's controller ID, and what WindowServer may
++               place its flip surfaces in (system memory backs them, nvAllocVram) */
++            setProperty("IOFBDependentID", 0x4E4D58560000001ull, 64);
++            setProperty("IOFBDependentIndex", 0ULL, 32);
++            setProperty("IOFBMemorySize", (unsigned long long)(1ull << 30), 64);
++            setProperty("built-in", kOSBooleanTrue);
++            nmxVramReserve(((unsigned long long)fInfo.pitch * fInfo.height * 65 / 64 + PAGE_SIZE - 1) &
++                           ~(unsigned long long)(PAGE_SIZE - 1));
++        } else {
++            setProperty("IOFBDependentID", pci->getRegistryEntryID(), 64);
++            setProperty("IOFBDependentIndex", 0ULL, 32);
++        }
+         nmx_trace("publish: start: IOFramebuffer::start", 0);
+         if (!IOFramebuffer::start(provider)) return false;
+         nmx_trace("publish: start: vblank timer (flags)", fFlags);
+@@ -140,6 +247,7 @@ public:
+             while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); }
+             fVblTimer = nullptr;
+         }
++        OSSafeReleaseNULL(fAccel);
+         IOFramebuffer::stop(provider);
+     }
+ 
+@@ -148,8 +256,53 @@ public:
+         nmx_trace("publish: cb open", 0);
+         IOReturn r = IOFramebuffer::open();
+         nmx_trace("publish: cb open done (ret)", (long)r);
++        /* 0x200: only an opened framebuffer may be registered with the accelerator's display machine (registering
++           before open panicked in IOFramebuffer::getAttributeExt); NMXAccel registers this head here, on WindowServer's
++           thread, before open returns, so WindowServer finds its display pipe (ericek111's NMXVGAFB::open) */
++        if ((fFlags & kFbAccelHead) && r == kIOReturnSuccess && opened && OSCompareAndSwap(0, 1, &fOpenedOnce)) {
++            setProperty("NMXVGAFBOpen", kOSBooleanTrue);
++            if (IOService *a = fAccel) {
++                const OSSymbol *fn = OSSymbol::withCStringNoCopy("nmxHeadOpened");
++                IOReturn ar = fn ? a->callPlatformFunction(fn, true, this, nullptr, nullptr, nullptr) : kIOReturnNoMemory;
++                OSSafeReleaseNULL(fn);
++                FBLOG("opened; the accelerator registered this head (0x%x)", ar);
++                nmx_trace("publish: accel: nmxHeadOpened (ret)", (long)ar);
++            } else {
++                FBLOG("opened before an accelerator armed this head: it registers the head when it does");
++                nmx_trace("publish: accel: opened before the accelerator armed it", 0);
++            }
++        }
+         return r;
+     }
++    IOReturn callPlatformFunction(const OSSymbol *fn, bool wait, void *p1, void *p2, void *p3, void *p4) override {
++        if (!(fFlags & kFbAccelHead) || fn == nullptr)
++            return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
++        if (fn->isEqualTo("nmxDisplayReady")) {             /* NMXAccel armed this head (its phase 1) */
++            IOService *a = OSDynamicCast(IOService, (OSObject *)p1);
++            if (!a) return kIOReturnBadArgument;
++            if (!fAccel) { a->retain(); if (!OSCompareAndSwapPtr(nullptr, a, (void *volatile *)&fAccel)) a->release(); }
++            nmx_trace("publish: accel: nmxDisplayReady", 0);
++            nmx_gpu_accel_armed(getProvider());
++            return kIOReturnSuccess;
++        }
++        if (fn->isEqualTo("nvAllocVram") || fn->isEqualTo("nvFreeVram")) {
++            NVRMVramRequest *r = (NVRMVramRequest *)p1;
++            if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++            return fn->isEqualTo("nvAllocVram") ? nmxVramAlloc(r) : nmxVramFree(r);
++        }
++        if (fn->isEqualTo("nvScanoutInfo")) {
++            /* the real physical address of the live scan-out (stolen memory): with phys 0 CoreDisplay failed
++               MPAccessSurfaceForDisplayDevice and WindowServer stayed on the CPU (ericek111) */
++            NVRMVramRequest *r = (NVRMVramRequest *)p1;
++            if (!r || r->version != NVRM_VRAM_ABI_VERSION) return kIOReturnBadArgument;
++            r->kva = (void *)(uintptr_t)fInfo.kva;
++            r->phys = fInfo.phys;
++            r->actualSize = (unsigned long long)fInfo.pitch * fInfo.height;
++            r->width = fInfo.width; r->height = fInfo.height; r->pitch = fInfo.pitch;
++            return kIOReturnSuccess;
++        }
++        return IOFramebuffer::callPlatformFunction(fn, wait, p1, p2, p3, p4);
++    }
+     bool isConsoleDevice() override { nmx_trace("publish: cb isConsoleDevice", fFlags); return !(fFlags & kFbNoConsole); }
+     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
+         nmx_trace("publish: cb getApertureRange", (long)aperture);
+@@ -287,6 +440,12 @@ public:
+ };
+ OSDefineMetaClassAndStructors(NMXGPUFB, IOFramebuffer)
+ 
++/* the vendor-named class of the accelerated-head mode (0x200): what NMXAccel watches for and CoreDisplay accepts */
++class NMXIntelGPUFB : public NMXGPUFB {
++    OSDeclareDefaultStructors(NMXIntelGPUFB)
++};
++OSDefineMetaClassAndStructors(NMXIntelGPUFB, NMXGPUFB)
++
+ /*
+  * The firmware's boot display on the same GPU: on a hackintosh with no graphics kext macOS drives it with
+  * IONDRVFramebuffer, drawing into the GOP buffer. Once this driver has relit the outputs with its own buffer that
+@@ -409,7 +568,8 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+         retire_boot_framebuffer(gpu, nullptr, true);
+     }
+     nmx_trace("publish: IOFramebuffer init and attach", 0);
+-    NMXGPUFB *fb = OSTypeAlloc(NMXGPUFB);
++    NMXGPUFB *fb = (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbAccelHead) ? OSTypeAlloc(NMXIntelGPUFB) : OSTypeAlloc(NMXGPUFB);
++    nmx_trace("publish: framebuffer class (accelerated head)", (nmx_xnu_nvram_int("nullmoth-fbflags") & kFbAccelHead) != 0);
+     if (fb == nullptr || !fb->initWith(dev, info) || !fb->attach(gpu)) {
+         OSSafeReleaseNULL(fb);
+         nmx_fb_close(dev);
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index bd01cbe..062aadf 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -71,6 +71,7 @@ class NMXGPU : public IOService {
+ public:
+     /* holding_: 0 none, 1 held, 2 paused (around the boot framebuffer's synchronous retirement, xnu/nmx_fb.cpp) */
+     void pauseDisplayHold();
++    void accelArmed() { releaseDisplay("the accelerator armed the head"); }
+     void resumeDisplayHold();
+ private:
+     /* nmxtrace: what macOS does to this GPU and to the firmware's boot framebuffer around the publish */
+@@ -487,7 +488,12 @@ void NMXGPU::attachNow()
+     nmx_trace("attach: publishing the framebuffer", 0);
+     fb_ = nmx_fb_publish(this, dev_);
+     nmx_trace("attach: framebuffer published", fb_ != nullptr);
+-    releaseDisplay(fb_ != nullptr ? "framebuffer published" : "no framebuffer");
++    /* nullmoth-fbflags 0x200: the accelerator releases the hold when it has armed the head (nmxDisplayReady, below),
++       so WindowServer finds the head ready to composite on; the 30 s cap still applies */
++    if (fb_ != nullptr && (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x200))
++        nmx_trace("attach: display hold kept for the accelerator", 0);
++    else
++        releaseDisplay(fb_ != nullptr ? "framebuffer published" : "no framebuffer");
+     nmx_marker_write(false);
+     IOLog("NullMoth GPU: driving %04x:%04x (build %s)\n", pci_->configRead16(kIOPCIConfigVendorID),
+           pci_->configRead16(kIOPCIConfigDeviceID), NMX_BUILD_STAMP);
+@@ -530,6 +536,12 @@ void NMXGPU::resumeDisplayHold()
+     }
+ }
+ 
++extern "C++" void nmx_gpu_accel_armed(IOService *gpu)
++{
++    if (NMXGPU *g = OSDynamicCast(NMXGPU, gpu))
++        g->accelArmed();
++}
++
+ extern "C++" void nmx_gpu_pause_display_hold(IOService *gpu, bool pause)
+ {
+     NMXGPU *g = OSDynamicCast(NMXGPU, gpu);

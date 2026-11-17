@@ -1,0 +1,33 @@
+Subject: [PATCH 0066] xe GEM objects get .vmap/.vunmap (drm_gem_ttm_vmap) for NullMoth's display bridge
+
+Wildcat Lake test start 10 (with 0065) ran to the end: "NullMoth GPU: driving 8086:fd80", first interrupt delivered,
+scan-out buffer created in stolen memory. The bridge then failed: "the scan-out buffer would not map (102)"
+(EOPNOTSUPP from drm_gem_vmap): 6.14 xe's drm_gem_object_funcs have no .vmap, because Linux's xe console maps its
+buffer through xe_bo_vmap(); amdgpu, which the bridge was written against, uses drm_gem_ttm_vmap.
+
+- fork_xe.py: xe_gem_object_funcs gets .vmap = drm_gem_ttm_vmap and .vunmap = drm_gem_ttm_vunmap (ttm_bo_vmap: for
+  stolen memory through BAR2, write-combined, via xe_ttm_stolen_io_mem_reserve).
+
+Seen in the same log, for later: "[drm] *ERROR* Unexpected child device config size 44 (expected 40 for VBT version
+266)": this machine's VBT is newer than 6.14's parser knows.
+
+Applies on top of 0051-0065.
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -316,6 +316,14 @@
+ trace_calls("display/xe_plane_initial.c", "static struct xe_bo *\ninitial_plane_bo(struct xe_device *xe,\n\t\t struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static bool\nintel_alloc_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t      struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static void\nintel_find_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t     struct intel_initial_plane_config plane_configs[])\n{\n")
++
++# NullMoth's display bridge maps its scan-out buffer with drm_client_buffer_vmap() -> drm_gem_vmap(), which needs
++# the GEM object's .vmap. amdgpu's objects have it (drm_gem_ttm_vmap); 6.14 xe's have none, because Linux's xe console
++# maps its buffer through xe_bo_vmap() instead. Wildcat Lake test 10: "the scan-out buffer would not map (102)"
++# (EOPNOTSUPP). The generic TTM helpers (ttm_bo_vmap: BAR2, write-combined, for stolen memory) are added here.
++edit("xe_bo.c", [("\t.mmap = drm_gem_ttm_mmap,\n\t.export = xe_gem_prime_export,\n",
++                  "\t.mmap = drm_gem_ttm_mmap,\n\t.vmap = drm_gem_ttm_vmap,\t/* NullMoth: drm_client_buffer_vmap */\n"
++                  "\t.vunmap = drm_gem_ttm_vunmap,\n\t.export = xe_gem_prime_export,\n", 1)])
+ 
+ # NullMoth's scan-out buffer, created through the dumb-buffer path, is a user (device) BO; xe clears a new user BO
+ # with a GPU job (xe_migrate_clear), and in stolen memory that job is where Wildcat Lake test 9 froze (last step

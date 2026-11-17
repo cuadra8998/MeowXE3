@@ -1,0 +1,55 @@
+diff -ruN a/gpu-port/xkpi/override/src/linux_compat.c b/gpu-port/xkpi/override/src/linux_compat.c
+--- a/gpu-port/xkpi/override/src/linux_compat.c	2026-11-16 15:06:00
++++ b/gpu-port/xkpi/override/src/linux_compat.c	2026-11-16 15:06:52
+@@ -557,6 +557,8 @@
+ 	__retval;				\
+ })
+ 
++void nmx_drm_file_opened(void *filp, int pid);	/* nmx_fb_bridge.c (MeowXE3) */
++
+ static int
+ linux_dev_fdopen(struct cdev *dev, int fflags, struct thread *td,
+     struct file *file)
+@@ -589,6 +591,9 @@
+ 			kfree(filp);
+ 			return (error);
+ 		}
++		/* MeowXE3: a DRM client is labelled with its process (as on Linux), not the opening thread */
++		if (td != NULL && td->td_proc != NULL)
++			nmx_drm_file_opened(filp, td->td_proc->p_pid);
+ 	}
+ 
+ 	/* hold on to the vnode - used for fstat() */
+diff -ruN a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 15:06:00
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 15:06:52
+@@ -518,6 +518,29 @@
+  */
+ uint64_t (*nmx_xe_tt_usage_hook)(struct drm_device *dev, uint64_t *size);
+ 
++/*
++ * After a device file opened (linux_compat.c): if it is a DRM client of a device the bridge drives, record the opening
++ * process. drm-kmod's FreeBSD branch stores task_pid(current), which in this port is the thread's id: the per-app GPU
++ * memory report could not name anyone.
++ */
++void nmx_drm_file_opened(void *filp, int pid);
++void nmx_drm_file_opened(void *filp, int pid)
++{
++    for (int i = 0; i < MAX_FB; i++) {
++        struct nmx_fb *fb = fbs[i].fb;
++        struct drm_file *file;
++        if (fb == NULL || fb->client.dev == NULL)
++            continue;
++        mutex_lock(&fb->client.dev->filelist_mutex);
++        list_for_each_entry(file, &fb->client.dev->filelist, lhead)
++            if ((void *)file->filp == filp) {
++                file->pid = pid;
++                break;
++            }
++        mutex_unlock(&fb->client.dev->filelist_mutex);
++    }
++}
++
+ int nmx_gpu_clients(void *devp, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size)
+ {
+     struct nmx_fb *fb = fb_of(devp);

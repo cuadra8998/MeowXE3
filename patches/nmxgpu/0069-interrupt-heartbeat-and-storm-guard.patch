@@ -1,0 +1,171 @@
+Subject: [PATCH 0069] nmxtrace: GPU interrupt heartbeat in NVRAM and an interrupt-storm guard
+
+Wildcat Lake test starts 11-13: the panel modeset succeeds, then the whole Mac freezes a few seconds later, each
+time at a different step of the attach thread (IOFramebuffer start, registerService, registerPowerDriver), with
+nothing of the start saved to the log. Something asynchronous takes the machine down; an interrupt the 6.14 display
+code does not acknowledge on display 30.02 (firing without end) is a prime suspect.
+
+- xnu/nmx_pci.cpp: with nmxtrace set, from the first GPU interrupt a heartbeat writes
+  "t=<s> irqs=<total> rate=<last second>" to NVRAM (nullmoth-gpu-hb) every 2 s for 60 s, and more than 50000
+  interrupts within a second disables the interrupt source (logged and noted in nullmoth-gpu-hb) so the Mac survives.
+- xnu/nmx_kext.cpp: nmx_xnu_nvram_note(key, text); the breadcrumb uses it.
+- bsdcompat/src/nmx_trace.c: nmx_trace_get_level().
+Read after a start with:  nvram nullmoth-gpu-hb
+
+Applies on top of 0051-0068.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_pci.cpp b/gpu-port/xkpi/xnu/nmx_pci.cpp
+--- a/gpu-port/xkpi/xnu/nmx_pci.cpp
++++ b/gpu-port/xkpi/xnu/nmx_pci.cpp
+@@ -12,7 +12,11 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOKitKeys.h>
+ #include "nmx_xnu.h"
++#include <kern/thread_call.h>
+ 
++extern "C" int nmx_trace_get_level(void);                         /* bsdcompat/src/nmx_trace.c */
++extern "C" void nmx_xnu_nvram_note(const char *key, const char *text);  /* xnu/nmx_kext.cpp */
++
+ extern "C" uint32_t nmx_xnu_pci_read(void *pci, int reg, int width)
+ {
+     IOPCIDevice *d = (IOPCIDevice *)pci;
+@@ -182,16 +186,71 @@
+     void (*handler)(void *);
+     void *arg;
+     volatile SInt32 delivered;
+-    bool initIrq() { delivered = 0; return init(); }
++    /* nmxtrace: interrupts per second, a heartbeat in NVRAM, and a guard against an interrupt storm */
++    uint64_t winStart;
++    uint32_t winCount, lastRate;
++    bool stormed;
++    thread_call_t hb;
++    uint32_t hbTicks;
++    bool initIrq() { delivered = 0; winStart = 0; winCount = lastRate = 0; stormed = false; hb = nullptr; hbTicks = 0; return init(); }
+ };
+ OSDefineMetaClassAndStructors(NMXIrq, OSObject)
+ 
++/*
++ * nmxtrace heartbeat (Wildcat Lake: after the first panel modeset the whole Mac froze a few seconds later, at a
++ * different step each start, with nothing saved to the log). Every 2 s for 60 s from the first GPU interrupt it writes
++ * "t=<s> irqs=<total> rate=<last second>" to NVRAM (nullmoth-gpu-hb), so the next start shows how long the Mac lived
++ * and whether the GPU's interrupt rate ran away.
++ */
++static void irq_heartbeat(thread_call_param_t p0, thread_call_param_t)
++{
++    NMXIrq *irq = (NMXIrq *)p0;
++    char note[96];
++    irq->hbTicks++;
++    snprintf(note, sizeof(note), "t=%u irqs=%d rate=%u%s", irq->hbTicks * 2, irq->delivered, irq->lastRate,
++             irq->stormed ? " storm-guard-tripped" : "");
++    IOLog("NullMoth GPU: heartbeat %s\n", note);
++    nmx_xnu_nvram_note("nullmoth-gpu-hb", note);
++    if (irq->hbTicks < 30) {
++        uint64_t d;
++        clock_interval_to_deadline(2000, kMillisecondScale, &d);
++        thread_call_enter_delayed(irq->hb, d);
++    }
++}
++
+ static void irq_action(OSObject *owner, IOInterruptEventSource *src, int count)
+ {
+     NMXIrq *irq = OSDynamicCast(NMXIrq, owner);
+     if (irq) {
+-        if (OSIncrementAtomic(&irq->delivered) == 0)
++        if (OSIncrementAtomic(&irq->delivered) == 0) {
+             IOLog("NullMoth GPU: first interrupt delivered\n");
++            if (nmx_trace_get_level() > 0 && (irq->hb = thread_call_allocate(irq_heartbeat, irq)) != nullptr) {
++                uint64_t d;
++                clock_interval_to_deadline(2000, kMillisecondScale, &d);
++                thread_call_enter_delayed(irq->hb, d);
++            }
++        }
++        if (nmx_trace_get_level() > 0) {
++            uint64_t now = mach_absolute_time(), sec;
++            nanoseconds_to_absolutetime(1000000000ull, &sec);
++            if (now - irq->winStart >= sec) {
++                irq->lastRate = irq->winCount;
++                irq->winStart = now;
++                irq->winCount = 0;
++            }
++            /* more than 50000 a second: a source nobody acknowledges. Stop it before it takes the Mac down. */
++            if (++irq->winCount > 50000 && !irq->stormed) {
++                irq->stormed = true;
++                IOLog("NullMoth GPU: interrupt storm (%u in under a second, %d in all): GPU interrupts disabled\n",
++                      irq->winCount, irq->delivered);
++                char note[96];
++                snprintf(note, sizeof(note), "storm: %u/s after %d interrupts, GPU interrupts disabled",
++                         irq->winCount, irq->delivered);
++                nmx_xnu_nvram_note("nullmoth-gpu-hb", note);
++                src->disable();
++                return;
++            }
++        }
+         irq->handler(irq->arg);
+     }
+ }
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -222,19 +222,19 @@
+  * a start that hangs with a black screen and no saved log still tells, at the next start, the last step it reached
+  * (Wildcat Lake test 5: the panel went black during xe_gt_init_hwconfig and nothing was logged).
+  */
+-extern "C" void nmx_xnu_trace_breadcrumb(const char *step)
++extern "C" void nmx_xnu_nvram_note(const char *key, const char *text)
+ {
+     IODTNVRAM *n = nmx_nvram();
+-    if (n == nullptr || step == nullptr) {
++    if (n == nullptr || key == nullptr || text == nullptr) {
+         if (n)
+             n->release();
+         return;
+     }
+-    size_t len = strlen(step);
++    size_t len = strlen(text);
+     if (len > 120)
+         len = 120;
+-    const OSSymbol *k = OSSymbol::withCString("nullmoth-gpu-trace");
+-    OSData *d = OSData::withBytes(step, (unsigned)len);
++    const OSSymbol *k = OSSymbol::withCString(key);
++    OSData *d = OSData::withBytes(text, (unsigned)len);
+     if (k != nullptr && d != nullptr)
+         n->setProperty(k, d);
+     if (d)
+@@ -245,6 +245,11 @@
+     n->release();
+ }
+ 
++extern "C" void nmx_xnu_trace_breadcrumb(const char *step)
++{
++    nmx_xnu_nvram_note("nullmoth-gpu-trace", step);
++}
++
+ void NMXGPU::attachNow()
+ {
+     nmx_trace("attach: waiting for the firmware folder", 0);
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+@@ -19,6 +19,7 @@
+ void nmx_trace_init(void);
+ void nmx_trace(const char *what, long val);
+ void nmx_xnu_trace_breadcrumb(const char *step);	/* xnu/nmx_kext.cpp */
++int nmx_trace_get_level(void);
+ 
+ static int nmx_trace_level = -1;
+ 
+@@ -40,6 +41,14 @@
+         printf("NullMoth trace: on (level %d)\n", level);
+ }
+ 
++/* the nmxtrace level (0 when off), for the interrupt heartbeat in xnu/nmx_pci.cpp */
++int nmx_trace_get_level(void)
++{
++    if (nmx_trace_level < 0)
++        nmx_trace_init();
++    return nmx_trace_level;
++}
++
+ void nmx_trace(const char *what, long val)
+ {
+     if (nmx_trace_level < 0)

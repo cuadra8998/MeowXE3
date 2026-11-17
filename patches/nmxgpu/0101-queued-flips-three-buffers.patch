@@ -1,0 +1,331 @@
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 13:56:29
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 13:56:29
+@@ -15,6 +15,8 @@
+ #include <linux/iosys-map.h>
+ #include <linux/ktime.h>
+ #include <linux/mutex.h>
++#include <linux/workqueue.h>
++#include <linux/wait.h>
+ 
+ #include <drm/drm_client.h>
+ #include <drm/drm_device.h>
+@@ -37,17 +39,27 @@
+     int registered;     /* drm_client_register returned: hotplugs from here on are real */
+     int dpms_on;        /* outputs lit (the open leaves them on); nmx_fb_power skips a request for the current state */
+     /*
+-     * Double buffering for NMXAccel's copied frames (nmx_fb_back / nmx_fb_flip): 'buffer' is always the one on the
+-     * outputs, 'back' the one a frame is copied into before it is flipped onto them at vertical blank. A copy into the
+-     * buffer being scanned out tore (dragging a window, Wildcat Lake).
++     * Up to three scan-out buffers for NMXAccel's copied frames (nmx_fb_back / nmx_fb_flip). 'buffer'/'map' always
++     * name the one on the outputs (slot[front]). A frame is copied into a buffer that is neither on the outputs nor
++     * being flipped, and flipped on at vertical blank by flip_work, so the caller (WindowServer's present) does not
++     * wait for the flip: waiting for it took 12 ms of every 16.7 ms frame and halved the frame rate of heavy
++     * animations (genie, window drags; MeowXE3 1.0.2 timers). A copy into the buffer being scanned out tore.
+      */
+-    struct drm_client_buffer *back;
+-    struct iosys_map back_map;
+-    int back_mapped;
+-    int flips_ok;       /* flipping works: off when there is no back buffer or a flip took over kFlipMaxNs */
++    struct drm_client_buffer *slot[3];
++    struct iosys_map slot_map[3];
++    int slot_mapped[3];
++    int slot_state[3];  /* SLOT_* */
++    int nslots;         /* 1 (no flips), 2 or 3 */
++    int front;          /* the slot on the outputs */
++    int flips_ok;       /* flipping works: off when there is no second buffer or a flip failed or took over kFlipMaxNs */
+     struct mutex flip_lock;
++    struct workqueue_struct *flip_wq;
++    struct work_struct flip_work;
++    wait_queue_head_t flip_wait;    /* a slot became free, or flips went off */
+ };
+ 
++enum { SLOT_FREE, SLOT_WRITING, SLOT_QUEUED, SLOT_PENDING, SLOT_FRONT };
++
+ void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+ int nmx_xnu_nvram_int(const char *key);	/* xnu/nmx_kext.cpp */
+ 
+@@ -119,6 +131,7 @@
+ }
+ 
+ static void bridge_free(struct nmx_fb *fb);
++static void flip_worker(struct work_struct *work);
+ 
+ /* a userland KMS client (a DRM master) closed: put our scan-out back on the outputs */
+ static int bridge_restore(struct drm_client_dev *client)
+@@ -150,14 +163,22 @@
+ 
+ static void bridge_free(struct nmx_fb *fb)
+ {
+-    if (fb->mapped)
+-        drm_client_buffer_vunmap(fb->buffer);
+-    if (fb->buffer != NULL)
+-        drm_client_framebuffer_delete(fb->buffer);
+-    if (fb->back_mapped)
+-        drm_client_buffer_vunmap(fb->back);
+-    if (fb->back != NULL)
+-        drm_client_framebuffer_delete(fb->back);
++    if (fb->flip_wq != NULL) {
++        cancel_work_sync(&fb->flip_work);
++        destroy_workqueue(fb->flip_wq);
++    }
++    if (fb->nslots == 0) {     /* failed before the flip buffers were set up: only 'buffer' exists */
++        if (fb->mapped)
++            drm_client_buffer_vunmap(fb->buffer);
++        if (fb->buffer != NULL)
++            drm_client_framebuffer_delete(fb->buffer);
++    }
++    for (int i = 0; i < fb->nslots; i++) {
++        if (fb->slot_mapped[i])
++            drm_client_buffer_vunmap(fb->slot[i]);
++        if (fb->slot[i] != NULL)
++            drm_client_framebuffer_delete(fb->slot[i]);
++    }
+     drm_client_release(&fb->client);
+     kfree(fb);
+ }
+@@ -265,29 +286,41 @@
+     nmx_trace("fb: clearing the buffer (phys)", (long)base);
+     memset(__DECONST(char *, va), 0, size);       /* black until WindowServer draws */
+ 
+-    /* the back buffer of NMXAccel's double-buffered frames (optional: without it frames are copied onto 'buffer') */
++    /* NMXAccel's flip buffers: slot 0 is 'buffer'; up to two more (optional: without them frames are copied onto it) */
+     mutex_init(&fb->flip_lock);
+-    nmx_fb_want_stolen = 1;
+-    fb->back = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
+-    nmx_fb_want_stolen = 0;
+-    if (IS_ERR(fb->back)) {
+-        printf("NullMoth display: no second scan-out buffer (%ld): frames are copied onto the visible one\n",
+-               PTR_ERR(fb->back));
+-        fb->back = NULL;
+-    } else if (fb->back->fb->pitches[0] != out->pitch || drm_client_buffer_vmap(fb->back, &fb->back_map) != 0) {
+-        printf("NullMoth display: the second scan-out buffer is unusable: frames are copied onto the visible one\n");
+-        drm_client_framebuffer_delete(fb->back);
+-        fb->back = NULL;
+-    } else {
+-        fb->back_mapped = 1;
+-        char *bva = fb->back_map.is_iomem ? (char *)fb->back_map.vaddr_iomem : (char *)fb->back_map.vaddr;
+-        memset(bva, 0, size);
+-        /*
+-         * Opt-in (nullmoth-fbflags 0x400) while flips are brought up: on Wildcat Lake the first flip's commit never
+-         * programmed the plane (no pipe update, no vblank event) and timed out after 10 s (test of 0098).
+-         */
+-        fb->flips_ok = (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x400) != 0;
++    init_waitqueue_head(&fb->flip_wait);
++    fb->slot[0] = fb->buffer; fb->slot_map[0] = fb->map; fb->slot_mapped[0] = fb->mapped;
++    fb->slot_state[0] = SLOT_FRONT; fb->front = 0; fb->nslots = 1;
++    while (fb->nslots < 3) {
++        int i = fb->nslots;
++        struct drm_client_buffer *b;
++        nmx_fb_want_stolen = 1;
++        b = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
++        nmx_fb_want_stolen = 0;
++        if (IS_ERR(b)) {
++            printf("NullMoth display: scan-out buffer %d not created (%ld)\n", i + 1, PTR_ERR(b));
++            break;
++        }
++        if (b->fb->pitches[0] != out->pitch || drm_client_buffer_vmap(b, &fb->slot_map[i]) != 0) {
++            printf("NullMoth display: scan-out buffer %d is unusable\n", i + 1);
++            drm_client_framebuffer_delete(b);
++            break;
++        }
++        fb->slot[i] = b; fb->slot_mapped[i] = 1; fb->slot_state[i] = SLOT_FREE; fb->nslots++;
++        memset(fb->slot_map[i].is_iomem ? (char *)fb->slot_map[i].vaddr_iomem : (char *)fb->slot_map[i].vaddr, 0, size);
+     }
++    /*
++     * Opt-in (nullmoth-fbflags 0x400): on Wildcat Lake a flip's commit first took the DSB path, whose completion
++     * interrupt never came (0100 keeps flips off the DSB).
++     */
++    fb->flips_ok = fb->nslots >= 2 && (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x400) != 0;
++    if (fb->flips_ok) {
++        INIT_WORK(&fb->flip_work, flip_worker);
++        fb->flip_wq = alloc_ordered_workqueue("nmx_flip", 0);
++        if (fb->flip_wq == NULL)
++            fb->flips_ok = 0;
++    }
++    printf("NullMoth display: %d scan-out buffers, flips %s\n", fb->nslots, fb->flips_ok ? "on (queued)" : "off");
+     nmx_trace("fb: back buffer for flips", fb->flips_ok);
+ 
+     mutex_lock(&fb->client.modeset_mutex);
+@@ -357,80 +390,123 @@
+     return 0;
+ }
+ 
+-/* the buffer the next frame goes into (not on the outputs: the last flip has landed, nmx_fb_flip is synchronous) */
++static int slot_in(struct nmx_fb *fb, int state)
++{
++    for (int i = 0; i < fb->nslots; i++)
++        if (fb->slot_state[i] == state)
++            return i;
++    return -1;
++}
++
++/*
++ * The buffer the next frame goes into: one neither on the outputs nor being flipped. A queued frame that has not been
++ * flipped yet is overwritten (the newer frame wins). Waits only with two buffers while a flip is in progress.
++ */
+ int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch)
+ {
+     struct nmx_fb *fb = fb_of(dev);
+     if (fb == NULL)
+         return ENODEV;
+     mutex_lock(&fb->flip_lock);
+-    int err = fb->flips_ok && fb->back != NULL ? 0 : ENODEV;
++    int i = -1;
++    for (int tries = 0; tries < 2 && fb->flips_ok; tries++) {
++        if ((i = slot_in(fb, SLOT_WRITING)) >= 0 || (i = slot_in(fb, SLOT_FREE)) >= 0 || (i = slot_in(fb, SLOT_QUEUED)) >= 0)
++            break;
++        mutex_unlock(&fb->flip_lock);
++        wait_event_timeout(fb->flip_wait, !fb->flips_ok || slot_in(fb, SLOT_PENDING) < 0, HZ / 10);
++        mutex_lock(&fb->flip_lock);
++    }
++    int err = fb->flips_ok && i >= 0 ? 0 : (fb->flips_ok ? EBUSY : ENODEV);
+     if (!err) {
+-        *kva = map_kva(&fb->back_map);
+-        *pitch = fb->back->fb->pitches[0];
++        fb->slot_state[i] = SLOT_WRITING;
++        *kva = map_kva(&fb->slot_map[i]);
++        *pitch = fb->slot[i]->fb->pitches[0];
+     }
+     mutex_unlock(&fb->flip_lock);
+     return err;
+ }
+ 
++static void point_outputs_at(struct nmx_fb *fb, struct drm_client_buffer *b)
++{
++    struct drm_mode_set *ms;
++    mutex_lock(&fb->client.modeset_mutex);
++    drm_client_for_each_modeset(ms, &fb->client)
++        if (ms->mode != NULL)
++            ms->fb = b->fb;
++    mutex_unlock(&fb->client.modeset_mutex);
++}
++
+ /*
+- * Puts the back buffer on the outputs (the plane's new address latches at vertical blank) and swaps the roles. The
+- * commit waits for flip_done, so the old front is free when this returns. A flip that takes longer than kFlipMaxNs
+- * (the 10 s flip_done timeout of a commit whose vblank never comes, seen on this display engine) turns flipping off
+- * for this start: NMXAccel then copies onto the visible buffer again (nmx_fb_back fails).
++ * Flips queued frames onto the outputs, one blocking commit each (the plane's new address latches at vertical blank).
++ * A commit that fails or takes longer than kFlipMaxNs (the 10 s flip_done timeout of a commit whose vblank never
++ * comes, seen on this display engine) turns flipping off for this start: the outputs keep the buffer they had and
++ * NMXAccel copies onto it from then on (nmx_fb_back fails).
+  */
+ #define kFlipMaxNs (100ull * 1000 * 1000)
++static void flip_worker(struct work_struct *work)
++{
++    struct nmx_fb *fb = container_of(work, struct nmx_fb, flip_work);
++    for (;;) {
++        mutex_lock(&fb->flip_lock);
++        int q = fb->flips_ok && fb->dpms_on ? slot_in(fb, SLOT_QUEUED) : -1;
++        if (q < 0) {
++            mutex_unlock(&fb->flip_lock);
++            return;
++        }
++        fb->slot_state[q] = SLOT_PENDING;
++        point_outputs_at(fb, fb->slot[q]);
++        mutex_unlock(&fb->flip_lock);
++
++        uint64_t t0 = ktime_get_ns();
++        int err = -drm_client_modeset_commit(&fb->client);
++        uint64_t dt = ktime_get_ns() - t0;
++
++        mutex_lock(&fb->flip_lock);
++        if (err || dt > kFlipMaxNs) {
++            fb->slot_state[q] = SLOT_FREE;
++            for (int i = 0; i < fb->nslots; i++)
++                if (fb->slot_state[i] != SLOT_FRONT)
++                    fb->slot_state[i] = SLOT_FREE;
++            fb->flips_ok = 0;
++            point_outputs_at(fb, fb->slot[fb->front]);
++            if (err)
++                printf("NullMoth display: a flip failed (%d): frames are copied onto the visible buffer from now on\n", err);
++            else
++                printf("NullMoth display: a flip took %llu ms: flips off, frames are copied onto the visible buffer again\n",
++                       (unsigned long long)(dt / 1000000));
++        } else {
++            fb->slot_state[fb->front] = SLOT_FREE;
++            fb->slot_state[q] = SLOT_FRONT;
++            fb->front = q;
++            fb->buffer = fb->slot[q];
++            fb->map = fb->slot_map[q];
++        }
++        mutex_unlock(&fb->flip_lock);
++        wake_up_all(&fb->flip_wait);
++    }
++}
++
++/* Queues the frame just copied (nmx_fb_back) for the next vertical blank and returns without waiting for it. */
+ int nmx_fb_flip(void *dev)
+ {
+     struct nmx_fb *fb = fb_of(dev);
+-    struct drm_mode_set *ms;
+     if (fb == NULL)
+         return ENODEV;
+     mutex_lock(&fb->flip_lock);
+-    if (!fb->flips_ok || fb->back == NULL || !fb->dpms_on) {
++    int w = slot_in(fb, SLOT_WRITING);
++    if (!fb->flips_ok || !fb->dpms_on || w < 0) {
++        if (w >= 0)
++            fb->slot_state[w] = SLOT_FREE;
+         mutex_unlock(&fb->flip_lock);
+-        return ENODEV;
++        return w < 0 ? EINVAL : ENODEV;
+     }
+-    mutex_lock(&fb->client.modeset_mutex);
+-    drm_client_for_each_modeset(ms, &fb->client)
+-        if (ms->mode != NULL)
+-            ms->fb = fb->back->fb;
+-    mutex_unlock(&fb->client.modeset_mutex);
+-    uint64_t t0 = ktime_get_ns();
+-    int err = -drm_client_modeset_commit(&fb->client);
+-    uint64_t dt = ktime_get_ns() - t0;
+-    if (err) {
+-        mutex_lock(&fb->client.modeset_mutex);
+-        drm_client_for_each_modeset(ms, &fb->client)
+-            if (ms->mode != NULL)
+-                ms->fb = fb->buffer->fb;
+-        mutex_unlock(&fb->client.modeset_mutex);
+-        fb->flips_ok = 0;
+-        printf("NullMoth display: a flip failed (%d): frames are copied onto the visible buffer from now on\n", err);
+-    } else if (dt > kFlipMaxNs) {
+-        /*
+-         * A flip that took this long timed out waiting for flip_done: whether the plane moved is unknown (on Wildcat
+-         * Lake it did not, and taking the back buffer for the visible one sent every later frame to the hidden buffer:
+-         * a black screen). Put the first buffer back on the outputs with the same commit path, which a commit that
+-         * names the buffer already there completes either way, and copy onto it from now on.
+-         */
+-        fb->flips_ok = 0;
+-        mutex_lock(&fb->client.modeset_mutex);
+-        drm_client_for_each_modeset(ms, &fb->client)
+-            if (ms->mode != NULL)
+-                ms->fb = fb->buffer->fb;
+-        mutex_unlock(&fb->client.modeset_mutex);
+-        printf("NullMoth display: a flip took %llu ms: flips off, frames are copied onto the visible buffer again\n",
+-               (unsigned long long)(dt / 1000000));
+-        err = ETIMEDOUT;
+-    } else {
+-        struct drm_client_buffer *b = fb->buffer;
+-        struct iosys_map m = fb->map;
+-        fb->buffer = fb->back; fb->map = fb->back_map;
+-        fb->back = b; fb->back_map = m;
+-    }
++    int old = slot_in(fb, SLOT_QUEUED);
++    if (old >= 0)
++        fb->slot_state[old] = SLOT_FREE;     /* replaced by this newer frame before it reached the outputs */
++    fb->slot_state[w] = SLOT_QUEUED;
+     mutex_unlock(&fb->flip_lock);
+-    return err;
++    queue_work(fb->flip_wq, &fb->flip_work);
++    return 0;
+ }
+ 
+ /* display sleep and wake from macOS (IOFramebuffer power) */
+@@ -449,6 +525,8 @@
+                 return 0;
+             }
+             nmx_trace("fb: power (on)", on);
++            if (fbs[i].fb->flip_wq != NULL)
++                flush_work(&fbs[i].fb->flip_work);     /* no flip commit racing the power change */
+             int err = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
+             nmx_trace("fb: power done (err)", err);
+             if (err == 0)

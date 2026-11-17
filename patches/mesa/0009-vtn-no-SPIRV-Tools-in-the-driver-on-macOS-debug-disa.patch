@@ -1,0 +1,39 @@
+From 1e7a745f27502b8f5e9dbc1ebff112601eeaf1c2 Mon Sep 17 00:00:00 2001
+From: nmx <nmx@local>
+Date: Sun, 15 Nov 2026 01:37:54 -0800
+Subject: [PATCH] vtn: no SPIRV-Tools in the driver on macOS (debug disassembly
+ only)
+
+---
+ src/compiler/spirv/meson.build | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/compiler/spirv/meson.build b/src/compiler/spirv/meson.build
+index b49d3af..0563aa8 100644
+--- a/src/compiler/spirv/meson.build
++++ b/src/compiler/spirv/meson.build
+@@ -53,14 +53,18 @@ libvtn = static_library(
+    vtn_generator_ids_h,
+   ],
+   include_directories : [inc_include, inc_src],
+-  c_args : [c_msvc_compat_args, soong_compat_c_args, no_override_init_args],
++  # macOS (NullMoth): the driver's copy does without SPIRV-Tools, which it used only to disassemble SPIR-V in debug
++  # output (vtn_debug.c); a toolchain's libSPIRV-Tools brings its own libc++ into every Metal process. mesa_clc
++  # still links SPIRV-Tools itself (src/compiler/clc).
++  c_args : [c_msvc_compat_args, soong_compat_c_args, no_override_init_args,
++            host_machine.system() == 'darwin' ? '-UHAVE_SPIRV_TOOLS' : []],
+   gnu_symbol_visibility : 'hidden',
+-  dependencies : [dep_spirv_tools, idep_nir, dep_valgrind],
++  dependencies : [host_machine.system() == 'darwin' ? [] : dep_spirv_tools, idep_nir, dep_valgrind],
+   build_by_default : false,
+ )
+ 
+ idep_vtn = declare_dependency(
+-  dependencies : [dep_spirv_tools, idep_nir, idep_mesautil],
++  dependencies : [host_machine.system() == 'darwin' ? [] : dep_spirv_tools, idep_nir, idep_mesautil],
+   link_with : libvtn,
+   sources : [spirv_info_h],
+ )
+-- 
+2.50.1 (Apple Git-155)
+

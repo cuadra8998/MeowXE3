@@ -1,0 +1,185 @@
+Subject: [PATCH 0055] Bring-up checkpoints for the GPU attach (nmxtrace / nmxdrmdebug)
+
+The first bare-metal test start on Wildcat Lake froze inside NMXGPU's attach: the last console line was
+"NullMoth Intel: stolen memory 0x0, 64 MiB", xe printed nothing, and no log survived. This adds checkpoints so the
+next test shows which step never returns. Everything is off unless the boot arguments are set; no driver logic changes.
+
+- bsdcompat/src/nmx_trace.c (new): nmxtrace=1 prints "NMXT <step>" before each step; nmxtrace=2 also waits 200 ms
+  so the line reaches the screen before a hang. nmxdrmdebug=<mask> sets drm.debug (e.g. 0x6 = driver + KMS).
+- xnu/nmx_kext.cpp: checkpoints around the firmware wait, the driver hand-off and the framebuffer publish.
+- bsdcompat/src/nmx_port.c: checkpoints around the device record, display pre-attach and the bus add (driver probe).
+- fork_xe.py: a checkpoint before every statement-level call in xe_pci_probe, xe_device_probe_early and
+  xe_device_probe (14 + 5 + 35).
+
+Applies on top of 0051-0054.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -23,6 +23,9 @@
+ #include <kern/thread.h>
+ #include "nmx_port.h"
+ #include "nmx_xnu.h"
++
++/* bring-up checkpoints, off unless the boot argument nmxtrace is set (bsdcompat/src/nmx_trace.c) */
++extern "C" void nmx_trace(const char *what, long val);
+ #if __has_include("nmx_buildstamp.h")
+ #include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
+ #else
+@@ -216,7 +219,9 @@
+ 
+ void NMXGPU::attachNow()
+ {
++    nmx_trace("attach: waiting for the firmware folder", 0);
+     int err = nmx_xnu_wait_firmware_root(300);
++    nmx_trace("attach: firmware folder (err)", err);
+     if (err) {
+         IOLog("NullMoth GPU: the firmware folder never appeared (%d); this GPU stays with macOS\n", err);
+         attach_ = -1;
+@@ -231,7 +236,9 @@
+         return;
+     }
+     nmx_marker_write(true);
++    nmx_trace("attach: boot guard set, offering the GPU to the drivers", 0);
+     dev_ = nmx_port_attach(pci_);
++    nmx_trace("attach: drivers returned (attached)", dev_ != nullptr);
+     if (dev_ == nullptr) {
+         nmx_marker_write(false);
+         IOLog("NullMoth GPU: no driver took %04x:%04x\n", pci_->configRead16(kIOPCIConfigVendorID),
+@@ -254,7 +261,9 @@
+     pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
+     pci_->registerService();
+     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
++    nmx_trace("attach: publishing the framebuffer", 0);
+     fb_ = nmx_fb_publish(this, dev_);
++    nmx_trace("attach: framebuffer published", fb_ != nullptr);
+     nmx_marker_write(false);
+     IOLog("NullMoth GPU: driving %04x:%04x (build %s)\n", pci_->configRead16(kIOPCIConfigVendorID),
+           pci_->configRead16(kIOPCIConfigDeviceID), NMX_BUILD_STAMP);
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_port.c b/gpu-port/xkpi/bsdcompat/src/nmx_port.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_port.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_port.c
+@@ -14,6 +14,8 @@
+ #include "nmx_xnu.h"
+ #include "nmx_port.h"
+ 
++void nmx_trace(const char *what, long val);	/* nmx_trace.c: off unless nmxtrace is set */
++
+ int nmx_kernel_init(void);
+ void nmx_kernel_fini(void);
+ int nmx_malloc_init(void);
+@@ -89,12 +91,17 @@
+ 
+ static void *attach_on(void *iopci, const char *busclass, int display)
+ {
++    nmx_trace("port: device record", 0);
+     device_t dev = nmx_device_for_pci(iopci);
+     if (dev == NULL)
+         return NULL;
+-    if (display)
++    if (display) {
++        nmx_trace("port: before attach (display)", 0);
+         nmx_fb_before_attach();
++    }
++    nmx_trace("port: adding the device to the bus (drivers probe now)", 0);
+     int err = nmx_bus_add_device(dev, busclass);
++    nmx_trace("port: bus add returned (err)", err);
+     device_t *kids = NULL;
+     int n = 0, attached = 0;
+     if (err == 0 && device_get_children(dev, &kids, &n) == 0) {
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -267,3 +267,41 @@
+ # TEMPORARY (2026-10-16): a VM_BIND that fails with EFAULT in WindowServer only - say which copy failed
+ edit("xe_vm.c", [("\t\t\terr = -EFAULT;\n\t\t\tgoto free_bind_ops;\n",
+      "\t\t\terr = -EFAULT;\n\t\t\tprintf(\"xe vm_bind: copying %u bind ops from 0x%llx failed\\n\", args->num_binds, (unsigned long long)args->vector_of_binds);\n\t\t\tgoto free_bind_ops;\n", 1)])
++
++# Bring-up checkpoints (Wildcat Lake: the first bare-metal attach froze before xe printed a line). Before each call in
++# xe's probe path, nmx_trace("<function>: <call>") prints a line when the boot argument nmxtrace is set
++# (bsdcompat/src/nmx_trace.c), so the last line on the screen names the step that never returned. Off by default;
++# a line is inserted only before a statement of its own (not the body of a brace-less if/for, not a continuation).
++import re
++def trace_calls(name, header):
++    p = os.path.join(root, name)
++    t = open(p).read()
++    assert t.count(header) == 1, (name, header[:60])
++    i = t.index(header) + len(header)
++    j = t.index("\n}\n", i)
++    func = re.search(r"(\w+)\(", header).group(1)
++    skip = ("if", "for", "while", "switch", "return", "sizeof", "goto")
++    out, prev, n = [], "{", 0
++    for line in t[i:j].split("\n"):
++        m = re.match(r"^(\t+)(?:\w+ = )?([a-z_][a-z0-9_]*)\(", line)
++        p_ = prev.strip()
++        own = p_ == "" or p_.endswith((";", "{", "}", "*/")) or p_.endswith(":")
++        if (m and own and m.group(2) not in skip
++                and not m.group(2).startswith(("drm_", "dev_", "for_each", "str_", "nmx_trace"))):
++            out.append(f'{m.group(1)}nmx_trace("{func}: {m.group(2)}", 0);')
++            n += 1
++        out.append(line)
++        if line.strip():
++            prev = line
++    t = t[:i] + "\n".join(out) + t[j:]
++    if "void nmx_trace(const char *what, long val);" not in t:
++        k = t.index("#include")
++        t = t[:k] + "void nmx_trace(const char *what, long val);\t/* NullMoth: bsdcompat/src/nmx_trace.c */\n" + t[k:]
++    open(p + ".tmp", "w").write(t)
++    os.replace(p + ".tmp", p)
++    assert n > 0, (name, func)
++    print(f"trace: {n} checkpoints in {func}")
++
++trace_calls("xe_pci.c", "static int xe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)\n{\n")
++trace_calls("xe_device.c", "int xe_device_probe_early(struct xe_device *xe)\n{\n")
++trace_calls("xe_device.c", "int xe_device_probe(struct xe_device *xe)\n{\n")
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+new file mode 100644
+--- /dev/null
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+@@ -0,0 +1,46 @@
++/*
++ * Bring-up checkpoints for a GPU whose first attach stops the Mac (Wildcat Lake: the first test start froze inside
++ * the attach before xe printed a line, and nothing reached the log). Off unless asked for at boot:
++ *   nmxtrace=1         prints "NMXT <step>" on the console before each step of the attach and of xe's probe
++ *   nmxtrace=2         the same, then waits 200 ms so the line is on screen before a step that hangs
++ *   nmxdrmdebug=<mask> sets drm.debug (DRM_UT_* bits; 0x106 = driver, KMS, DP) for this start
++ * The steps are marked in xnu/nmx_kext.cpp, bsdcompat/src/nmx_port.c and (by fork_xe.py) xe's probe functions.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++
++extern unsigned long __drm_debug;	/* drm-kmod's drm_print.c */
++
++void nmx_trace_init(void);
++void nmx_trace(const char *what, long val);
++
++static int nmx_trace_level = -1;
++
++void nmx_trace_init(void)
++{
++    int level = 0;
++    unsigned int mask = 0;
++
++    if (nmx_trace_level >= 0)
++        return;
++    if (!PE_parse_boot_argn("nmxtrace", &level, sizeof(level)))
++        level = 0;
++    nmx_trace_level = level;
++    if (PE_parse_boot_argn("nmxdrmdebug", &mask, sizeof(mask))) {
++        __drm_debug = mask;
++        printf("NullMoth trace: drm debug 0x%x\n", mask);
++    }
++    if (level > 0)
++        printf("NullMoth trace: on (level %d)\n", level);
++}
++
++void nmx_trace(const char *what, long val)
++{
++    if (nmx_trace_level < 0)
++        nmx_trace_init();
++    if (nmx_trace_level <= 0)
++        return;
++    printf("NMXT %s %ld\n", what, val);
++    if (nmx_trace_level >= 2)
++        IOSleep(200);
++}

@@ -1,0 +1,77 @@
+Subject: [PATCH 0071] Debug switch nullmoth-fbflags: framebuffer without console role and/or vblank timer
+
+Wildcat Lake test start 15 (nullmoth-fbstop=1): modeset done, no IOFramebuffer -> the Mac stayed alive, heartbeat to
+t=60 with a steady vblank rate, attach finished ("driving 8086:fd80"), clean shutdown. The display runs fine; the
+freeze in starts 11-14 follows IOFramebuffer::start within a fraction of a second, so it is something the
+framebuffer sets going on the macOS side. Two things act at once there: the kernel console taking it over
+(isConsoleDevice) and the 60 Hz software vblank timer.
+
+- xnu/nmx_fb.cpp: NVRAM nullmoth-fbflags, read in initWith: 0x1 = isConsoleDevice() false, 0x2 = no vblank timer.
+Set with  sudo nvram nullmoth-fbflags=3 ; clear with  sudo nvram -d nullmoth-fbflags
+
+Applies on top of 0051-0070.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -16,6 +16,13 @@
+ #include "nmx_port.h"
+ 
+ extern "C" void nmx_trace(const char *what, long val);    /* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
++/*
++ * Bring-up bisection of the freeze that follows IOFramebuffer::start on Wildcat Lake (the display itself runs fine:
++ * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
++ * is created: 0x1 = not the console device, 0x2 = no software vblank timer.
++ */
++enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -36,6 +43,7 @@
+     thread_call_t fVblTimer = nullptr;
+     uint64_t fVblNext = 0;
+     volatile bool fStopping = false;
++    int fFlags = 0;
+ 
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         NMXGPUFB *me = (NMXGPUFB *)p0;
+@@ -52,6 +60,10 @@
+     bool initWith(void *dev, const nmx_fb_info &info) {
+         if (!init()) return false;
+         fDev = dev;
++        fFlags = nmx_xnu_nvram_int("nullmoth-fbflags");
++        if (fFlags)
++            FBLOG("nullmoth-fbflags 0x%x:%s%s", fFlags, (fFlags & kFbNoConsole) ? " not the console" : "",
++                  (fFlags & kFbNoVblank) ? " no vblank timer" : "");
+         fInfo = info;
+         if (info.pclk_khz && info.htotal && info.vtotal) {
+             uint64_t mhz = (uint64_t)info.pclk_khz * 1000000ull / ((uint64_t)info.htotal * info.vtotal);   /* milli-Hz */
+@@ -66,8 +78,8 @@
+     bool start(IOService *provider) override {
+         nmx_trace("publish: start: IOFramebuffer::start", 0);
+         if (!IOFramebuffer::start(provider)) return false;
+-        nmx_trace("publish: start: vblank timer", 0);
+-        fVblTimer = thread_call_allocate(vblFire, this);
++        nmx_trace("publish: start: vblank timer (flags)", fFlags);
++        fVblTimer = (fFlags & kFbNoVblank) ? nullptr : thread_call_allocate(vblFire, this);
+         if (fVblTimer) {
+             uint64_t d;
+             clock_interval_to_deadline((uint32_t)(fFrameNs / 1000), kMicrosecondScale, &d);
+@@ -94,7 +106,7 @@
+     }
+ 
+     IOReturn enableController() override { nmx_trace("publish: cb enableController", 0); return kIOReturnSuccess; }
+-    bool isConsoleDevice() override { nmx_trace("publish: cb isConsoleDevice", 0); return true; }
++    bool isConsoleDevice() override { nmx_trace("publish: cb isConsoleDevice", fFlags); return !(fFlags & kFbNoConsole); }
+     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
+         nmx_trace("publish: cb getApertureRange", (long)aperture);
+         if (aperture != kIOFBSystemAperture) return nullptr;
+@@ -266,7 +278,6 @@
+ }
+ 
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
+-extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
+ extern "C" int nmx_fb_skip_commit;                     /* override/src/nmx_fb_bridge.c */
+ 
+ /*

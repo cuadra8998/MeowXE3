@@ -1,0 +1,35 @@
+diff --git a/drivers/gpu/drm/i915/display/intel_dsb.c b/drivers/gpu/drm/i915/display/intel_dsb.c
+index e6f8fc7..f07d0c0 100644
+--- a/drivers/gpu/drm/i915/display/intel_dsb.c
++++ b/drivers/gpu/drm/i915/display/intel_dsb.c
+@@ -19,6 +19,14 @@
+ #include "intel_vrr.h"
+ #include "skl_watermark.h"
+ 
++/*
++ * NullMoth: nullmoth-fbflags 0x400 (panel flips) commits plane updates with MMIO writes under vblank evasion, not with
++ * the DSB. On Wildcat Lake a DSB flip never raised its completion interrupt, so the flip's vblank event (sent from
++ * intel_dsb_irq_handler) never came and flip_done timed out after 10 s. intel_dsb_prepare returning NULL is the same
++ * fallback as enable_dsb=0.
++ */
++int nmx_xnu_nvram_int(const char *key);	/* NMXGPU xnu/nmx_kext.cpp */
++
+ #define CACHELINE_BYTES 64
+ 
+ struct intel_dsb {
+@@ -763,6 +771,15 @@ struct intel_dsb *intel_dsb_prepare(struct intel_atomic_state *state,
+ 	if (!i915->display.params.enable_dsb)
+ 		return NULL;
+ 
++	{
++		/* read once, at the first commit: a one-shot test boot's NVRAM may be cleared later */
++		static int nmx_flags = -1;
++		if (nmx_flags < 0)
++			nmx_flags = nmx_xnu_nvram_int("nullmoth-fbflags");
++		if (nmx_flags & 0x400)
++			return NULL;
++	}
++
+ 	dsb = kzalloc(sizeof(*dsb), GFP_KERNEL);
+ 	if (!dsb)
+ 		goto out;

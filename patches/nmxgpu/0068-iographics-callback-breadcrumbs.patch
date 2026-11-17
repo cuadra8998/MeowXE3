@@ -1,0 +1,92 @@
+Subject: [PATCH 0068] Breadcrumbs in the IOGraphics callbacks of NMXGPU's framebuffer
+
+Wildcat Lake test start 12 (with 0067): NMXGPUFB::start completed and the start froze with "publish: registerService"
+as the last breadcrumb; nothing of that start reached the log. registerService() only queues matching, so the freeze
+most likely came from what IOGraphics does with the new framebuffer on its own threads (open, aperture mapping,
+display mode, interrupts, power, console).
+
+- xnu/nmx_fb.cpp: a "publish: cb <callback> <argument>" breadcrumb on entry to enableController, isConsoleDevice,
+  getApertureRange, getVRAMRange, setDisplayMode, registerForInterruptType, setApertureEnable, setPowerState,
+  setAttribute and setAttributeForConnection.
+- override/src/nmx_fb_bridge.c: "fb: power" before and after nmx_fb_power's DPMS commit.
+
+Applies on top of 0051-0067.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -93,13 +93,14 @@
+         IOFramebuffer::stop(provider);
+     }
+ 
+-    IOReturn enableController() override { return kIOReturnSuccess; }
+-    bool isConsoleDevice() override { return true; }
++    IOReturn enableController() override { nmx_trace("publish: cb enableController", 0); return kIOReturnSuccess; }
++    bool isConsoleDevice() override { nmx_trace("publish: cb isConsoleDevice", 0); return true; }
+     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
++        nmx_trace("publish: cb getApertureRange", (long)aperture);
+         if (aperture != kIOFBSystemAperture) return nullptr;
+         return IODeviceMemory::withRange(fInfo.phys, (IOPhysicalLength)fInfo.pitch * fInfo.height);
+     }
+-    IODeviceMemory *getVRAMRange() override { return IODeviceMemory::withRange(fInfo.phys, fInfo.size); }
++    IODeviceMemory *getVRAMRange() override { nmx_trace("publish: cb getVRAMRange", 0); return IODeviceMemory::withRange(fInfo.phys, fInfo.size); }
+     const char *getPixelFormats() override { return IO32BitDirectPixels "\0"; }
+     IOItemCount getDisplayModeCount() override { return 1; }
+     IOReturn getDisplayModes(IODisplayModeID *modes) override { modes[0] = 1; return kIOReturnSuccess; }
+@@ -155,11 +156,13 @@
+         return kIOReturnSuccess;
+     }
+     IOReturn setDisplayMode(IODisplayModeID mode, IOIndex depth) override {
++        nmx_trace("publish: cb setDisplayMode", (long)mode);
+         return (mode == 1 && depth == 0) ? kIOReturnSuccess : kIOReturnUnsupported;
+     }
+     IOItemCount getConnectionCount() override { return 1; }
+     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref,
+                                       void **iref) override {
++        nmx_trace("publish: cb registerForInterruptType", (long)type);
+         if (type == kIOFBVBLInterruptType) { fVbl = { proc, target, ref }; if (iref) *iref = &fVbl; return kIOReturnSuccess; }
+         if (type == kIOFBConnectInterruptType) { fConnect = { proc, target, ref }; if (iref) *iref = &fConnect; return kIOReturnSuccess; }
+         return kIOReturnUnsupported;
+@@ -169,14 +172,16 @@
+     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *) override { return kIOReturnSuccess; }
+     IOReturn setGammaTable(UInt32, UInt32, UInt32, void *, bool) override { return kIOReturnSuccess; }
+     IOReturn setCLUTWithEntries(IOColorEntry *, UInt32, UInt32, IOOptionBits) override { return kIOReturnSuccess; }
+-    IOReturn setApertureEnable(IOPixelAperture, IOOptionBits) override { return kIOReturnSuccess; }
++    IOReturn setApertureEnable(IOPixelAperture, IOOptionBits e) override { nmx_trace("publish: cb setApertureEnable", (long)e); return kIOReturnSuccess; }
+     IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
+     /* power acknowledged at once; left to IOFramebuffer it waits on a shared thread (seen with NVRMFB) */
+     IOReturn setPowerState(unsigned long ordinal, IOService *) override {
++        nmx_trace("publish: cb setPowerState", (long)ordinal);
+         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+         return kIOPMAckImplied;
+     }
+     IOReturn setAttribute(IOSelect attribute, uintptr_t value) override {
++        nmx_trace("publish: cb setAttribute", (long)attribute);
+         if (attribute == kIOWindowServerActiveAttribute) return kIOReturnSuccess;
+         if (attribute == kIOPowerAttribute) {
+             /* display sleep turns the outputs off; wake lights them again with the same buffer */
+@@ -193,6 +198,7 @@
+         return IOFramebuffer::setAttribute(attribute, value);
+     }
+     IOReturn setAttributeForConnection(IOIndex idx, IOSelect attribute, uintptr_t value) override {
++        nmx_trace("publish: cb setAttributeForConnection", (long)attribute);
+         switch (attribute) {
+         case kConnectionPower: case kConnectionColorModesSupported: case kConnectionColorDepthsSupported:
+         case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported: case kConnectionColorMode:
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -278,7 +278,11 @@
+ int nmx_fb_power(void *dev, int on)
+ {
+     for (int i = 0; i < MAX_FB; i++)
+-        if (fbs[i].dev == dev)
+-            return -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
++        if (fbs[i].dev == dev) {
++            nmx_trace("fb: power (on)", on);
++            int err = -drm_client_modeset_dpms(&fbs[i].fb->client, on ? DRM_MODE_DPMS_ON : DRM_MODE_DPMS_OFF);
++            nmx_trace("fb: power done (err)", err);
++            return err;
++        }
+     return ENODEV;
+ }

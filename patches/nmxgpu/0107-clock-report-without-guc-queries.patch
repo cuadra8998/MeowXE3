@@ -1,0 +1,28 @@
+diff -ruN a/gpu-port/xkpi/override/xe/nmx_xe_module.c b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-17 02:54:05
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-17 02:56:06
+@@ -52,8 +52,8 @@
+     xe_pm_runtime_get(xe);
+     freq[0] = xe_guc_pc_get_act_freq(pc);
+     xe_guc_pc_get_cur_freq(pc, &freq[1]);
+-    xe_guc_pc_get_min_freq(pc, &freq[2]);
+-    xe_guc_pc_get_max_freq(pc, &freq[3]);
++    /* min/max are not read: each is a GuC request (pc_action_query_task_state) answered while the GuC schedules
++     * work; polled every 5 s they coincided with render-engine hangs (Minecraft 1.12.2, MeowXE3 1.0.9) */
+     freq[4] = xe_guc_pc_get_rp0_freq(pc);
+     freq[5] = xe_guc_pc_get_rpe_freq(pc);
+     freq[6] = xe_guc_pc_get_rpn_freq(pc);
+diff -ruN a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-17 02:54:05
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-17 02:56:06
+@@ -288,8 +288,8 @@
+                 uint32_t f[7];
+                 if (nmx_fb_gpufreq(me->fDev, f) == 0) {
+                     char fs[160];
+-                    snprintf(fs, sizeof(fs), "actual %u MHz, requested %u MHz, min %u, max %u; hardware RP0 %u, RPe %u, RPn %u MHz",
+-                             f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
++                    snprintf(fs, sizeof(fs), "actual %u MHz, requested %u MHz; hardware RP0 %u, RPe %u, RPn %u MHz",
++                             f[0], f[1], f[4], f[5], f[6]);
+                     me->setProperty("MeowXE3GPUFreq", fs);
+                 }
+                 if (lines) { me->setProperty("MeowXE3GPUClients", lines); lines->release(); }

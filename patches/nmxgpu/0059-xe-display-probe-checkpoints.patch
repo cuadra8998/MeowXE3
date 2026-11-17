@@ -1,0 +1,24 @@
+Subject: [PATCH 0059] Checkpoints in xe's takeover of the firmware framebuffer
+
+Wildcat Lake test start 6 got through GuC firmware load, the DMC program, stolen memory, CDCLK and the eDP panel
+(AUX A, DPCD, EDID, "using preferred EDID fixed mode 1920x1080 60") and then went black and stopped, inside
+xe_display_init_noaccel. These checkpoints (with 0060's in the display driver) narrow down which step.
+
+- fork_xe.py: nmx_trace before each call in xe's intel_initial_plane_config, intel_find_initial_plane_obj,
+  intel_alloc_initial_plane_obj and initial_plane_bo (display/xe_plane_initial.c). Off unless nmxtrace is set.
+
+Applies on top of 0051-0058.
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -305,3 +305,9 @@
+ trace_calls("xe_pci.c", "static int xe_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)\n{\n")
+ trace_calls("xe_device.c", "int xe_device_probe_early(struct xe_device *xe)\n{\n")
+ trace_calls("xe_device.c", "int xe_device_probe(struct xe_device *xe)\n{\n")
++# the display side of xe's probe (Wildcat Lake test 6: the panel went black after "using preferred EDID fixed mode",
++# inside xe_display_init_noaccel): xe's takeover of the firmware framebuffer and its later display init
++trace_calls("display/xe_plane_initial.c", "void intel_initial_plane_config(struct intel_display *display)\n{\n")
++trace_calls("display/xe_plane_initial.c", "static struct xe_bo *\ninitial_plane_bo(struct xe_device *xe,\n\t\t struct intel_initial_plane_config *plane_config)\n{\n")
++trace_calls("display/xe_plane_initial.c", "static bool\nintel_alloc_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t      struct intel_initial_plane_config *plane_config)\n{\n")
++trace_calls("display/xe_plane_initial.c", "static void\nintel_find_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t     struct intel_initial_plane_config plane_configs[])\n{\n")

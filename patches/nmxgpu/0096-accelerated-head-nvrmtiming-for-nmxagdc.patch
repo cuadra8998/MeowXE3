@@ -1,0 +1,28 @@
+Subject: [PATCH 0096] accelerated head: publish NVRMTiming for NMXAGDC's link-configuration answers
+
+NMXAGDC (ericek111's AGDC for the VM display, generated from NullMoth's NVRMAGDC) answers AGDC K5 link-configuration
+queries from the framebuffer's NVRMTiming record, as NVRMFB and NMXVGAFB publish it. In the accelerated-head mode
+(nullmoth-fbflags 0x200) the panel framebuffer publishes it from the panel mode xe set: pixel clock in Hz, horizontal
+and vertical active/sync start/sync end/total (absolute), refresh in mHz, positive sync.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 8816562..1c8412e 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -215,6 +215,16 @@ public:
+             setProperty("built-in", kOSBooleanTrue);
+             nmxVramReserve(((unsigned long long)fInfo.pitch * fInfo.height * 65 / 64 + PAGE_SIZE - 1) &
+                            ~(unsigned long long)(PAGE_SIZE - 1));
++            /* NVRMTiming: the record NMXAGDC's link-configuration answers (AGDC K5) read, as NMXVGAFB and NVRMFB
++               publish it: magic, pixel clock (Hz), h active/sync start/sync end/total, the same four vertically,
++               refresh (mHz), sync polarities */
++            if (fInfo.pclk_khz && fInfo.htotal && fInfo.vtotal) {
++                uint32_t mhz = (uint32_t)((uint64_t)fInfo.pclk_khz * 1000000ull / ((uint64_t)fInfo.htotal * fInfo.vtotal));
++                UInt32 k5[13] = { 0x4b350001u, fInfo.pclk_khz * 1000u, fInfo.width, fInfo.hsync_start, fInfo.hsync_end,
++                                  fInfo.htotal, fInfo.height, fInfo.vsync_start, fInfo.vsync_end, fInfo.vtotal, mhz, 1u, 1u };
++                if (OSData *k5d = OSData::withBytes(k5, sizeof k5)) { setProperty("NVRMTiming", k5d); k5d->release(); }
++                nmx_trace("publish: accel: NVRMTiming refresh (mHz)", (long)mhz);
++            }
+         } else {
+             setProperty("IOFBDependentID", pci->getRegistryEntryID(), 64);
+             setProperty("IOFBDependentIndex", 0ULL, 32);

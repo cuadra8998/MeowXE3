@@ -1,0 +1,84 @@
+Subject: [PATCH 0067] nmxtrace=3 writes NVRAM only for NMXGPU's own steps; steps inside NMXGPUFB::start
+
+Wildcat Lake test start 11 (with 0066): the scan-out buffer mapped (vmap 0), the panel modeset succeeded
+("modeset commit (err) 0", vblanks at 16.6 ms, no FIFO underruns), drm_client_register's re-commit ran, and the start
+froze after "publish: IOFramebuffer start". In the log every checkpoint cost ~15 ms (its NVRAM write) and one cost
+3.7 s while the whole Mac went silent and USB threads reported being stuck >1 s: the firmware compacting its NVRAM
+flash store, filled by hundreds of breadcrumb writes per start once the modeset path had checkpoints (0062).
+
+- bsdcompat/src/nmx_trace.c: nmxtrace=3 still prints every checkpoint but writes the NVRAM breadcrumb only for steps
+  named attach:, publish: or fb: (~25 per start).
+- xnu/nmx_fb.cpp: publish: steps around IOFramebuffer::start, the vblank timer and registerPowerDriver in
+  NMXGPUFB::start (the nmx_trace declaration moves to the top of the file).
+
+Applies on top of 0051-0066.
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+@@ -3,8 +3,11 @@
+  * the attach before xe printed a line, and nothing reached the log). Off unless asked for at boot:
+  *   nmxtrace=1         prints "NMXT <step>" on the console before each step of the attach and of xe's probe
+  *   nmxtrace=2         the same, then waits 200 ms so the line is on screen before a step that hangs
+- *   nmxtrace=3         prints each step and keeps the last one in NVRAM (nullmoth-gpu-trace, synced), for a hang
+- *                      that blanks the screen: read it at the next start with  nvram nullmoth-gpu-trace
++ *   nmxtrace=3         prints each step and keeps the last NMXGPU step (attach:, publish:, fb:) in NVRAM
++ *                      (nullmoth-gpu-trace, synced), for a hang that blanks the screen: read it at the next start
++ *                      with  nvram nullmoth-gpu-trace. Only those ~25 steps: every NVRAM write appends to the
++ *                      firmware's flash store, and hundreds per start (all of xe's and the display's checkpoints)
++ *                      filled it until the firmware compacted it, stalling the whole Mac for seconds (test 11).
+  *   nmxdrmdebug=<mask> sets drm.debug (DRM_UT_* bits; 0x106 = driver, KMS, DP) for this start
+  * The steps are marked in xnu/nmx_kext.cpp, bsdcompat/src/nmx_port.c and (by fork_xe.py) xe's probe functions.
+  */
+@@ -46,7 +49,8 @@
+     printf("NMXT %s %ld\n", what, val);
+     if (nmx_trace_level == 2)
+         IOSleep(200);
+-    if (nmx_trace_level >= 3) {
++    if (nmx_trace_level >= 3 && (strncmp(what, "attach:", 7) == 0 || strncmp(what, "publish:", 8) == 0 ||
++                                 strncmp(what, "fb:", 3) == 0)) {
+         char crumb[128];
+ 
+         snprintf(crumb, sizeof(crumb), "%s %ld", what, val);
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -15,6 +15,9 @@
+ #include <kern/thread_call.h>
+ #include "nmx_port.h"
+ 
++extern "C" void nmx_trace(const char *what, long val);    /* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++
++
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+ 
+ static IOPMPowerState kFbPowerStates[2] = {
+@@ -61,7 +64,9 @@
+     }
+ 
+     bool start(IOService *provider) override {
++        nmx_trace("publish: start: IOFramebuffer::start", 0);
+         if (!IOFramebuffer::start(provider)) return false;
++        nmx_trace("publish: start: vblank timer", 0);
+         fVblTimer = thread_call_allocate(vblFire, this);
+         if (fVblTimer) {
+             uint64_t d;
+@@ -69,7 +74,9 @@
+             fVblNext = d;
+             thread_call_enter_delayed(fVblTimer, d);
+         }
++        nmx_trace("publish: start: registerPowerDriver", 0);
+         registerPowerDriver(this, kFbPowerStates, 2);
++        nmx_trace("publish: start: done", 0);
+         FBLOG("framebuffer %ux%u at %u.%02u Hz", fInfo.width, fInfo.height, fRefresh16 >> 16,
+               ((fRefresh16 & 0xFFFF) * 100) >> 16);
+         return true;
+@@ -253,8 +260,6 @@
+ }
+ 
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
+-extern "C" void nmx_trace(const char *what, long val);    /* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+-
+ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+ {
+     nmx_fb_info info;

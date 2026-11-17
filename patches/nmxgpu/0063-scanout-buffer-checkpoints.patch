@@ -1,0 +1,55 @@
+Subject: [PATCH 0063] Checkpoints in the scan-out buffer creation; fork_xe's inserter skips locked regions
+
+Wildcat Lake test start 8 (nmxtrace=3) left "fb: scan-out buffer (width) 1920" in NVRAM: NMXGPU's display bridge
+had its DRM client and the panel's 1920x1080 mode, and the start stopped inside drm_client_framebuffer_create
+(the dumb buffer that 0053 places in stolen memory, GGTT-mapped).
+
+- fork_xe.py: trace_calls never inserts a checkpoint inside a spin_lock*/local_irq_*/preempt_disable region
+  (nmxtrace=3 writes NVRAM, which may sleep). New checkpoints in xe_bo_dumb_create, __xe_bo_create_locked,
+  xe_bo_move (placement; new stolen memory is cleared with a GPU job), __xe_ggtt_insert_bo_at, xe_ggtt_invalidate and
+  xe_gt_tlb_invalidation_ggtt (through the GuC once it runs). xe_ggtt_map_bo is left out: it loops once per page.
+
+Applies on top of 0051-0061.
+
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -281,16 +281,21 @@
+     j = t.index("\n}\n", i)
+     func = re.search(r"(\w+)\(", header).group(1)
+     skip = ("if", "for", "while", "switch", "return", "sizeof", "goto")
+-    out, prev, n = [], "{", 0
++    out, prev, n, locked = [], "{", 0, 0
++    lock_re = re.compile(r"\b(spin_lock\w*|raw_spin_lock\w*|local_irq_disable|local_irq_save|preempt_disable)\(")
++    unlock_re = re.compile(r"\b(spin_unlock\w*|raw_spin_unlock\w*|local_irq_enable|local_irq_restore|preempt_enable)\(")
+     for line in t[i:j].split("\n"):
+         m = re.match(r"^(\t+)(?:\w+ = )?([a-z_][a-z0-9_]*)\(", line)
+         p_ = prev.strip()
+         own = p_ == "" or p_.endswith((";", "{", "}", "*/")) or p_.endswith(":")
+-        if (m and own and m.group(2) not in skip
++        # never inside a spinlock / irq-off / preempt-off region: nmxtrace=3 writes NVRAM, which may sleep
++        if (m and own and locked == 0 and m.group(2) not in skip
+                 and not m.group(2).startswith(("drm_", "dev_", "for_each", "str_", "nmx_trace"))):
+             out.append(f'{m.group(1)}nmx_trace("{func}: {m.group(2)}", 0);')
+             n += 1
+         out.append(line)
++        locked += len(lock_re.findall(line)) - len(unlock_re.findall(line))
++        assert locked >= 0, (name, func, line)
+         if line.strip():
+             prev = line
+     t = t[:i] + "\n".join(out) + t[j:]
+@@ -311,3 +316,14 @@
+ trace_calls("display/xe_plane_initial.c", "static struct xe_bo *\ninitial_plane_bo(struct xe_device *xe,\n\t\t struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static bool\nintel_alloc_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t      struct intel_initial_plane_config *plane_config)\n{\n")
+ trace_calls("display/xe_plane_initial.c", "static void\nintel_find_initial_plane_obj(struct intel_crtc *crtc,\n\t\t\t     struct intel_initial_plane_config plane_configs[])\n{\n")
++
++# NullMoth's scan-out buffer (Wildcat Lake test 8 stopped in drm_client_framebuffer_create with "fb: scan-out buffer"):
++# the dumb buffer in stolen memory, its BO creation and placement (xe_bo_move clears new stolen memory with a GPU job),
++# its GGTT mapping and the GGTT TLB invalidation that follows (through the GuC once it runs). xe_ggtt_map_bo is left
++# out on purpose: it loops once per page.
++trace_calls("xe_bo.c", "int xe_bo_dumb_create(struct drm_file *file_priv,\n\t\t      struct drm_device *dev,\n\t\t      struct drm_mode_create_dumb *args)\n{\n")
++trace_calls("xe_bo.c", "static struct xe_bo *\n__xe_bo_create_locked(struct xe_device *xe,\n\t\t      struct xe_tile *tile, struct xe_vm *vm,\n\t\t      size_t size, u64 start, u64 end,\n\t\t      u16 cpu_caching, enum ttm_bo_type type, u32 flags,\n\t\t      u64 alignment)\n{\n")
++trace_calls("xe_bo.c", "static int xe_bo_move(struct ttm_buffer_object *ttm_bo, bool evict,\n\t\t      struct ttm_operation_ctx *ctx,\n\t\t      struct ttm_resource *new_mem,\n\t\t      struct ttm_place *hop)\n{\n")
++trace_calls("xe_ggtt.c", "static int __xe_ggtt_insert_bo_at(struct xe_ggtt *ggtt, struct xe_bo *bo,\n\t\t\t\t  u64 start, u64 end)\n{\n")
++trace_calls("xe_ggtt.c", "static void xe_ggtt_invalidate(struct xe_ggtt *ggtt)\n{\n")
++trace_calls("xe_gt_tlb_invalidation.c", "int xe_gt_tlb_invalidation_ggtt(struct xe_gt *gt)\n{\n")

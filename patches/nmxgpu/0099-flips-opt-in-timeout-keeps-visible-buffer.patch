@@ -1,0 +1,56 @@
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-15 22:45:13
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-15 22:45:13
+@@ -49,6 +49,7 @@
+ };
+ 
+ void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++int nmx_xnu_nvram_int(const char *key);	/* xnu/nmx_kext.cpp */
+ 
+ /* one bridge per PCI function the port drives */
+ #define MAX_FB 8
+@@ -281,7 +282,11 @@
+         fb->back_mapped = 1;
+         char *bva = fb->back_map.is_iomem ? (char *)fb->back_map.vaddr_iomem : (char *)fb->back_map.vaddr;
+         memset(bva, 0, size);
+-        fb->flips_ok = 1;
++        /*
++         * Opt-in (nullmoth-fbflags 0x400) while flips are brought up: on Wildcat Lake the first flip's commit never
++         * programmed the plane (no pipe update, no vblank event) and timed out after 10 s (test of 0098).
++         */
++        fb->flips_ok = (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x400) != 0;
+     }
+     nmx_trace("fb: back buffer for flips", fb->flips_ok);
+ 
+@@ -402,16 +407,27 @@
+         mutex_unlock(&fb->client.modeset_mutex);
+         fb->flips_ok = 0;
+         printf("NullMoth display: a flip failed (%d): frames are copied onto the visible buffer from now on\n", err);
++    } else if (dt > kFlipMaxNs) {
++        /*
++         * A flip that took this long timed out waiting for flip_done: whether the plane moved is unknown (on Wildcat
++         * Lake it did not, and taking the back buffer for the visible one sent every later frame to the hidden buffer:
++         * a black screen). Put the first buffer back on the outputs with the same commit path, which a commit that
++         * names the buffer already there completes either way, and copy onto it from now on.
++         */
++        fb->flips_ok = 0;
++        mutex_lock(&fb->client.modeset_mutex);
++        drm_client_for_each_modeset(ms, &fb->client)
++            if (ms->mode != NULL)
++                ms->fb = fb->buffer->fb;
++        mutex_unlock(&fb->client.modeset_mutex);
++        printf("NullMoth display: a flip took %llu ms: flips off, frames are copied onto the visible buffer again\n",
++               (unsigned long long)(dt / 1000000));
++        err = ETIMEDOUT;
+     } else {
+         struct drm_client_buffer *b = fb->buffer;
+         struct iosys_map m = fb->map;
+         fb->buffer = fb->back; fb->map = fb->back_map;
+         fb->back = b; fb->back_map = m;
+-        if (dt > kFlipMaxNs) {
+-            fb->flips_ok = 0;
+-            printf("NullMoth display: a flip took %llu ms: frames are copied onto the visible buffer from now on\n",
+-                   (unsigned long long)(dt / 1000000));
+-        }
+     }
+     mutex_unlock(&fb->flip_lock);
+     return err;

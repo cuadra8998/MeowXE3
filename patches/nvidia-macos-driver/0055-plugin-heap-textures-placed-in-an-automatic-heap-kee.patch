@@ -1,0 +1,28 @@
+From 3a87b9670b535ed7f112430a10553fdbeb4e3383 Mon Sep 17 00:00:00 2001
+From: watchthelight <admin@watchthelight.org>
+Date: Tue, 27 Oct 2026 18:08:43 -0400
+Subject: [PATCH 55/60] plugin: heap textures placed in an automatic heap keep
+ the descriptor swizzle (i-120, yellow symbol icons on intel)
+
+(cherry picked from commit 891ff1fdbb3c670045e97afb12c96ebed8d8388a)
+(cherry picked from commit 7475a103f5cfa8109ed5cee7ba112290432b1f4b)
+---
+ plugin/NVMTLObjects.m | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 6bb5238..26dfe09 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -3699,6 +3699,8 @@ - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)a {
+     _used += len;
+     atomic_fetch_add(&gHAPlaced, 1); atomic_fetch_add(&gHALive, len);
+     atomic_fetch_add(rec ? &gHTRecycled : &gHTPlaced, 1); nvmtl_heaptex_census(rec ? "recycled" : "placed");
++    // automatic heaps land here, not in -newTextureWithDescriptor:offset:; without this the descriptor's swizzle was lost
++    nvmtl_texture_desc_swizzle(t, d);
+     return t;
+ }
+ - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)d {
+-- 
+2.50.1 (Apple Git-155)
+

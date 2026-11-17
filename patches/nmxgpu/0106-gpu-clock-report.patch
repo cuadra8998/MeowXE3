@@ -1,0 +1,114 @@
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 20:46:48
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 20:48:19
+@@ -45,6 +45,8 @@
+  * the device has no panel with a backlight the display driver controls.
+  */
+ int nmx_fb_backlight(void *dev, int set, int *cur);
++/* MeowXE3: the GPU's clock from the GuC (MHz): actual, current request, min, max, RP0, RPe, RPn. 0 or ENODEV. */
++int nmx_fb_gpufreq(void *dev, uint32_t freq[7]);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 20:46:48
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 20:48:19
+@@ -45,6 +45,8 @@
+  * the device has no panel with a backlight the display driver controls.
+  */
+ int nmx_fb_backlight(void *dev, int set, int *cur);
++/* MeowXE3: the GPU's clock from the GuC (MHz): actual, current request, min, max, RP0, RPe, RPn. 0 or ENODEV. */
++int nmx_fb_gpufreq(void *dev, uint32_t freq[7]);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 20:46:48
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 20:48:19
+@@ -586,6 +586,16 @@
+     return nmx_xe_backlight_hook(fb->client.dev, set, cur);
+ }
+ 
++int (*nmx_xe_gpufreq_hook)(struct drm_device *dev, uint32_t freq[7]);   /* set by xe's module init */
++
++int nmx_fb_gpufreq(void *devp, uint32_t freq[7])
++{
++    struct nmx_fb *fb = fb_of(devp);
++    if (fb == NULL || fb->client.dev == NULL || nmx_xe_gpufreq_hook == NULL)
++        return ENODEV;
++    return nmx_xe_gpufreq_hook(fb->client.dev, freq);
++}
++
+ /* display sleep and wake from macOS (IOFramebuffer power) */
+ int nmx_fb_power(void *dev, int on)
+ {
+diff -ruN a/gpu-port/xkpi/override/xe/nmx_xe_module.c b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 20:46:48
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 20:48:19
+@@ -26,6 +26,9 @@
+ #include <drm/drm_modeset_lock.h>
+ #include "intel_backlight.h"
+ #include "intel_display_types.h"
++#include "xe_guc_pc.h"
++#include "xe_pm.h"
++#include "xe_gt_types.h"
+ 
+ /*
+  * MeowXE3: the system-memory heap xe gives userspace (TTM's TT manager: what ANV reports as its heap and measures its
+@@ -33,7 +36,31 @@
+  */
+ extern uint64_t (*nmx_xe_tt_usage_hook)(struct drm_device *dev, uint64_t *size);   /* override/src/nmx_fb_bridge.c */
+ extern int (*nmx_xe_backlight_hook)(struct drm_device *dev, int set, int *cur);     /* override/src/nmx_fb_bridge.c */
++extern int (*nmx_xe_gpufreq_hook)(struct drm_device *dev, uint32_t freq[7]);        /* override/src/nmx_fb_bridge.c */
+ 
++/* MeowXE3: the render GT's clock as the GuC reports it (MHz), for the 5-second report (as xe's sysfs freq0/ files). */
++static int nmx_xe_gpufreq(struct drm_device *dev, uint32_t freq[7])
++{
++    if (dev == NULL || dev->driver == NULL || dev->driver->name == NULL || strcmp(dev->driver->name, "xe") != 0)
++        return ENODEV;
++    struct xe_device *xe = to_xe_device(dev);
++    struct xe_gt *gt = xe_root_mmio_gt(xe);
++    if (gt == NULL)
++        return ENODEV;
++    struct xe_guc_pc *pc = &gt->uc.guc.pc;
++    memset(freq, 0, sizeof(uint32_t) * 7);
++    xe_pm_runtime_get(xe);
++    freq[0] = xe_guc_pc_get_act_freq(pc);
++    xe_guc_pc_get_cur_freq(pc, &freq[1]);
++    xe_guc_pc_get_min_freq(pc, &freq[2]);
++    xe_guc_pc_get_max_freq(pc, &freq[3]);
++    freq[4] = xe_guc_pc_get_rp0_freq(pc);
++    freq[5] = xe_guc_pc_get_rpe_freq(pc);
++    freq[6] = xe_guc_pc_get_rpn_freq(pc);
++    xe_pm_runtime_put(xe);
++    return 0;
++}
++
+ /*
+  * MeowXE3: the eDP panel's backlight for macOS's brightness keys and slider (NMXIntelGPUFB's backlight handler). The
+  * level goes through intel_backlight_set_acpi, the display driver's entry for firmware (ACPI) brightness requests: a
+@@ -134,6 +161,7 @@
+ {
+     nmx_xe_tt_usage_hook = nmx_xe_tt_usage;
+     nmx_xe_backlight_hook = nmx_xe_backlight;
++    nmx_xe_gpufreq_hook = nmx_xe_gpufreq;
+ 	for (nmx_xe_done = 0; nmx_xe_done < (int)ARRAY_SIZE(nmx_xe_steps); nmx_xe_done++) {
+ 		int err = nmx_xe_steps[nmx_xe_done].init();
+ 		if (err) {
+diff -ruN a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 20:46:48
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 20:48:19
+@@ -285,6 +285,13 @@
+                          (unsigned long long)(ttUsed >> 20), (unsigned long long)(ttSize >> 20), m,
+                          (unsigned long long)(sum >> 20), (long long)((int64_t)ttUsed - (int64_t)sum) / (1 << 20));
+                 me->setProperty("MeowXE3GPUMemory", summary);
++                uint32_t f[7];
++                if (nmx_fb_gpufreq(me->fDev, f) == 0) {
++                    char fs[160];
++                    snprintf(fs, sizeof(fs), "actual %u MHz, requested %u MHz, min %u, max %u; hardware RP0 %u, RPe %u, RPn %u MHz",
++                             f[0], f[1], f[2], f[3], f[4], f[5], f[6]);
++                    me->setProperty("MeowXE3GPUFreq", fs);
++                }
+                 if (lines) { me->setProperty("MeowXE3GPUClients", lines); lines->release(); }
+             }
+             IOFree(c, sizeof(nmx_gpu_client) * kMax);

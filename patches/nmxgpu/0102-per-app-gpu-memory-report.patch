@@ -1,0 +1,239 @@
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 14:57:23
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 15:01:05
+@@ -33,6 +33,13 @@
+ int nmx_fb_front(void *dev, uint64_t *kva);
+ int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch);
+ int nmx_fb_flip(void *dev);
++/*
++ * MeowXE3: per-client GPU memory (one entry per open DRM file: the process that opened it, its GEM objects and their
++ * size, and how much of that is shared with other processes) and the xe system-memory heap in use (TTM TT) and its size.
++ * Returns the number of entries (at most max), or -1 when the device has no bridge.
++ */
++struct nmx_gpu_client { int pid; unsigned int objects; uint64_t bytes; uint64_t shared_bytes; };
++int nmx_gpu_clients(void *dev, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 14:57:23
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 15:01:05
+@@ -33,6 +33,13 @@
+ int nmx_fb_front(void *dev, uint64_t *kva);
+ int nmx_fb_back(void *dev, uint64_t *kva, uint32_t *pitch);
+ int nmx_fb_flip(void *dev);
++/*
++ * MeowXE3: per-client GPU memory (one entry per open DRM file: the process that opened it, its GEM objects and their
++ * size, and how much of that is shared with other processes) and the xe system-memory heap in use (TTM TT) and its size.
++ * Returns the number of entries (at most max), or -1 when the device has no bridge.
++ */
++struct nmx_gpu_client { int pid; unsigned int objects; uint64_t bytes; uint64_t shared_bytes; };
++int nmx_gpu_clients(void *dev, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 14:57:23
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 15:01:05
+@@ -24,6 +24,9 @@
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_modes.h>
+ #include <drm/drm_crtc.h>
++#include <drm/drm_file.h>
++#include <drm/drm_gem.h>
++#include <linux/idr.h>
+ 
+ #include <sys/bus.h>
+ 
+@@ -507,6 +510,46 @@
+     mutex_unlock(&fb->flip_lock);
+     queue_work(fb->flip_wq, &fb->flip_work);
+     return 0;
++}
++
++/*
++ * Set by xe's module init (override/xe/nmx_xe_module.c): xe is linked as its own unit with its symbols local, so the
++ * bridge reaches its TT heap query through this pointer, as xe reaches nmx_fb_want_stolen the other way.
++ */
++uint64_t (*nmx_xe_tt_usage_hook)(struct drm_device *dev, uint64_t *size);
++
++int nmx_gpu_clients(void *devp, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size)
++{
++    struct nmx_fb *fb = fb_of(devp);
++    struct drm_file *file;
++    int n = 0;
++    *tt_used = 0;
++    *tt_size = 0;
++    if (fb == NULL || fb->client.dev == NULL)
++        return -1;
++    struct drm_device *dev = fb->client.dev;
++    mutex_lock(&dev->filelist_mutex);
++    list_for_each_entry(file, &dev->filelist, lhead) {
++        if (n >= max)
++            break;
++        struct nmx_gpu_client *c = &out[n++];
++        struct drm_gem_object *obj;
++        int id;
++        memset(c, 0, sizeof(*c));
++        c->pid = (int)file->pid;
++        spin_lock(&file->table_lock);
++        idr_for_each_entry(&file->object_idr, obj, id) {
++            c->objects++;
++            c->bytes += obj->size;
++            if (obj->handle_count > 1 || obj->dma_buf != NULL || obj->import_attach != NULL)
++                c->shared_bytes += obj->size;
++        }
++        spin_unlock(&file->table_lock);
++    }
++    mutex_unlock(&dev->filelist_mutex);
++    if (nmx_xe_tt_usage_hook != NULL)
++        *tt_used = nmx_xe_tt_usage_hook(dev, tt_size);
++    return n;
+ }
+ 
+ /* display sleep and wake from macOS (IOFramebuffer power) */
+diff -ruN a/gpu-port/xkpi/override/xe/nmx_xe_module.c b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 14:57:23
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 15:01:05
+@@ -18,7 +18,28 @@
+ #include "xe_observation.h"
+ #include "xe_pci.h"
+ #include "xe_sched_job.h"
++#include "xe_device.h"
++#include "xe_bo.h"
++#include <drm/ttm/ttm_device.h>
++#include <drm/ttm/ttm_resource.h>
+ 
++/*
++ * MeowXE3: the system-memory heap xe gives userspace (TTM's TT manager: what ANV reports as its heap and measures its
++ * budget against) - bytes in use and its size. 0 for a device another driver owns.
++ */
++extern uint64_t (*nmx_xe_tt_usage_hook)(struct drm_device *dev, uint64_t *size);   /* override/src/nmx_fb_bridge.c */
++static uint64_t nmx_xe_tt_usage(struct drm_device *dev, uint64_t *size)
++{
++    *size = 0;
++    if (dev == NULL || dev->driver == NULL || dev->driver->name == NULL || strcmp(dev->driver->name, "xe") != 0)
++        return 0;
++    struct ttm_resource_manager *man = ttm_manager_type(&to_xe_device(dev)->ttm, XE_PL_TT);
++    if (man == NULL)
++        return 0;
++    *size = (uint64_t)man->size << PAGE_SHIFT;
++    return ttm_resource_manager_usage(man);
++}
++
+ /* Panther Lake (Linux 6.14 pciids.h INTEL_PTL_IDS): forced so xe takes it; i915 does not know it */
+ /* Wildcat Lake (later Linux pciids.h INTEL_WCL_IDS, which current Linux maps to ptl_desc): fd80, fd81 */
+ #define NMX_XE_FORCE_PROBE "b080,b081,b082,b090,b091,b092,b0a0,b0a1,b0a2,b0b0,fd80,fd81"
+@@ -72,6 +93,7 @@
+ 
+ static int nmx_xe_init(void)
+ {
++    nmx_xe_tt_usage_hook = nmx_xe_tt_usage;
+ 	for (nmx_xe_done = 0; nmx_xe_done < (int)ARRAY_SIZE(nmx_xe_steps); nmx_xe_done++) {
+ 		int err = nmx_xe_steps[nmx_xe_done].init();
+ 		if (err) {
+diff -ruN a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 14:57:23
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 15:01:05
+@@ -15,6 +15,9 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/pci/IOPCIDevice.h>
+ #include <kern/thread_call.h>
++#include <sys/proc.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSString.h>
+ #include "nmx_port.h"
+ 
+ /* IOLog (FBLOG) also goes to the flight recorder (xnu/nmx_flight.cpp) */
+@@ -160,12 +163,67 @@
+     Irq fVbl, fConnect;
+     thread_call_t fVblTimer = nullptr;
+     uint64_t fVblNext = 0;
++    thread_call_t fMemTimer = nullptr;      /* MeowXE3: per-app GPU memory report, every 5 s (memFire) */
+     volatile bool fStopping = false;
+     int fFlags = 0;
+     IOService *fAccel = nullptr;            /* 0x200: the accelerator that armed this head (retained) */
+     volatile UInt32 fOpenedOnce = 0;
+     bool fFlipFailLogged = false;
+ 
++    /*
++     * MeowXE3: publishes which processes hold GPU memory (ioreg -r -c NMXIntelGPUFB -k MeowXE3GPUMemory). On an
++     * integrated GPU that memory is RAM, and the 4 GB heap filled up with Minecraft running (MeowXE3 1.0.3).
++     */
++    static void memFire(thread_call_param_t p0, thread_call_param_t) {
++        NMXGPUFB *me = (NMXGPUFB *)p0;
++        if (me->fStopping) return;
++        enum { kMax = 96 };
++        nmx_gpu_client *c = (nmx_gpu_client *)IOMalloc(sizeof(nmx_gpu_client) * kMax);
++        if (c != nullptr) {
++            uint64_t ttUsed = 0, ttSize = 0;
++            int n = nmx_gpu_clients(me->fDev, c, kMax, &ttUsed, &ttSize);
++            if (n >= 0) {
++                /* one line per process: a process can open the GPU more than once */
++                int files[kMax] = {};
++                int m = 0;
++                for (int i = 0; i < n; i++) {
++                    int j = 0;
++                    while (j < m && c[j].pid != c[i].pid) j++;
++                    if (j == m) { c[m] = c[i]; files[m] = 1; m++; }
++                    else if (j != i) { c[j].objects += c[i].objects; c[j].bytes += c[i].bytes; c[j].shared_bytes += c[i].shared_bytes; files[j]++; }
++                }
++                for (int i = 1; i < m; i++)        /* largest first */
++                    for (int j = i; j > 0 && c[j].bytes > c[j - 1].bytes; j--) {
++                        nmx_gpu_client x = c[j]; c[j] = c[j - 1]; c[j - 1] = x;
++                        int f = files[j]; files[j] = files[j - 1]; files[j - 1] = f;
++                    }
++                uint64_t sum = 0;
++                OSArray *lines = OSArray::withCapacity((unsigned)m);
++                for (int i = 0; i < m; i++) {
++                    char name[64] = "?", line[192];
++                    proc_name(c[i].pid, name, sizeof(name));
++                    sum += c[i].bytes;
++                    snprintf(line, sizeof(line), "%6llu MB  %s (pid %d): %u objects, %llu MB shared, %d file%s",
++                             (unsigned long long)(c[i].bytes >> 20), name, c[i].pid, c[i].objects,
++                             (unsigned long long)(c[i].shared_bytes >> 20), files[i], files[i] == 1 ? "" : "s");
++                    if (lines) if (OSString *s = OSString::withCString(line)) { lines->setObject(s); s->release(); }
++                }
++                char summary[256];
++                snprintf(summary, sizeof(summary),
++                         "xe system-memory heap: %llu MB in use of %llu MB; %d processes hold %llu MB through their handles "
++                         "(shared objects counted once per process); the rest (%lld MB) is held without a handle",
++                         (unsigned long long)(ttUsed >> 20), (unsigned long long)(ttSize >> 20), m,
++                         (unsigned long long)(sum >> 20), (long long)((int64_t)ttUsed - (int64_t)sum) / (1 << 20));
++                me->setProperty("MeowXE3GPUMemory", summary);
++                if (lines) { me->setProperty("MeowXE3GPUClients", lines); lines->release(); }
++            }
++            IOFree(c, sizeof(nmx_gpu_client) * kMax);
++        }
++        uint64_t d;
++        clock_interval_to_deadline(5, kSecondScale, &d);
++        thread_call_enter_delayed(me->fMemTimer, d);
++    }
++
+     static void vblFire(thread_call_param_t p0, thread_call_param_t) {
+         NMXGPUFB *me = (NMXGPUFB *)p0;
+         if (me->fStopping) return;
+@@ -240,6 +298,11 @@
+             fVblNext = d;
+             thread_call_enter_delayed(fVblTimer, d);
+         }
++        if ((fMemTimer = thread_call_allocate(memFire, this)) != nullptr) {
++            uint64_t d;
++            clock_interval_to_deadline(5, kSecondScale, &d);
++            thread_call_enter_delayed(fMemTimer, d);
++        }
+         nmx_trace("publish: start: registerPowerDriver (skipped)", fFlags & kFbNoPower);
+         if (!(fFlags & kFbNoPower))
+             registerPowerDriver(this, (fFlags & kFbIOGraphicsPower) ? kFbPowerStates3 : kFbPowerStates,
+@@ -257,6 +320,11 @@
+             thread_call_cancel(fVblTimer);
+             while (!thread_call_free(fVblTimer)) { thread_call_cancel(fVblTimer); IOSleep(5); }
+             fVblTimer = nullptr;
++        }
++        if (fMemTimer) {
++            thread_call_cancel(fMemTimer);
++            while (!thread_call_free(fMemTimer)) { thread_call_cancel(fMemTimer); IOSleep(5); }
++            fMemTimer = nullptr;
+         }
+         OSSafeReleaseNULL(fAccel);
+         IOFramebuffer::stop(provider);

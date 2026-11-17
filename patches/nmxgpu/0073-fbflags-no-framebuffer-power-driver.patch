@@ -1,0 +1,47 @@
+Subject: [PATCH 0073] nullmoth-fbflags 0x4: publish the framebuffer without registering its power driver
+
+Wildcat Lake test start 17 (0072, NMXGPU stays on): same freeze, last breadcrumb "publish: start:
+registerPowerDriver", no NMXGPU setPowerState call, and none of the instrumented IOGraphics callbacks ever ran. In four
+of the last five starts the freeze came right at the framebuffer's registerPowerDriver, which starts macOS's display
+power handling for it.
+
+- xnu/nmx_fb.cpp: nullmoth-fbflags bit 0x4 skips registerPowerDriver in NMXGPUFB::start.
+
+Applies on top of 0051-0072.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -20,9 +20,9 @@
+ /*
+  * Bring-up bisection of the freeze that follows IOFramebuffer::start on Wildcat Lake (the display itself runs fine:
+  * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
+- * is created: 0x1 = not the console device, 0x2 = no software vblank timer.
++ * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer.
+  */
+-enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2 };
++enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -64,6 +64,8 @@
+         if (fFlags)
+             FBLOG("nullmoth-fbflags 0x%x:%s%s", fFlags, (fFlags & kFbNoConsole) ? " not the console" : "",
+                   (fFlags & kFbNoVblank) ? " no vblank timer" : "");
++        if (fFlags & kFbNoPower)
++            FBLOG("nullmoth-fbflags: no power driver for the framebuffer");
+         fInfo = info;
+         if (info.pclk_khz && info.htotal && info.vtotal) {
+             uint64_t mhz = (uint64_t)info.pclk_khz * 1000000ull / ((uint64_t)info.htotal * info.vtotal);   /* milli-Hz */
+@@ -86,8 +88,9 @@
+             fVblNext = d;
+             thread_call_enter_delayed(fVblTimer, d);
+         }
+-        nmx_trace("publish: start: registerPowerDriver", 0);
+-        registerPowerDriver(this, kFbPowerStates, 2);
++        nmx_trace("publish: start: registerPowerDriver (skipped)", fFlags & kFbNoPower);
++        if (!(fFlags & kFbNoPower))
++            registerPowerDriver(this, kFbPowerStates, 2);
+         nmx_trace("publish: start: done", 0);
+         FBLOG("framebuffer %ux%u at %u.%02u Hz", fInfo.width, fInfo.height, fRefresh16 >> 16,
+               ((fRefresh16 & 0xFFFF) * 100) >> 16);

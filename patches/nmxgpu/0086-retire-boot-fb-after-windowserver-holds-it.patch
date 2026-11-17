@@ -1,0 +1,45 @@
+Subject: [PATCH 0086] retire: wait until the boot framebuffer is quiet and held by WindowServer
+
+Wildcat Lake tests 29 and 30: IOFramebuffer::terminate of the boot framebuffer panicked in
+AppleUpstreamUserClientDriver::fbNotificationOccurred (NULL), both times early in the start; test 28 retired it at
+15.5 s, after IOGraphics had opened it (14.3 s), without a panic. Before terminate, wait for the boot framebuffer to
+go quiet (15 s at most) and for an IOFramebufferUserClient below it (WindowServer holding it; 30 s at most, then
+retire anyway). Both waits are traced.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index ba68d2b..b66937c 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -331,6 +331,32 @@ static void retire_boot_framebuffer(IOService *gpu, IOService *mine, bool early
+     for (unsigned i = 0; i < victims->getCount(); i++) {
+         IOService *f = (IOService *)victims->getObject(i);
+         FBLOG("retiring the boot framebuffer %s", f->getMetaClass()->getClassName());
++        /*
++         * Wait until the boot framebuffer and its clients have finished starting: AppleUpstreamUserClientDriver
++         * takes IOGraphics notifications before its start has filled the field fbNotificationOccurred reads, and
++         * terminate's notification arriving in that window panicked on NULL (tests 29 and 30, at ~10 s; test 28
++         * retired at 15 s without it).
++         */
++        uint64_t quiet_ns = 15000000000ULL;
++        nmx_trace("publish: retire: boot framebuffer quiet (ret)", (long)f->waitQuiet(quiet_ns));
++        /*
++         * and until IOGraphics has opened it and WindowServer holds it (an IOFramebufferUserClient below it): test 28
++         * retired at 15.5 s, after that open (14.3 s), without a panic; tests 29 and 30 retired earlier and panicked.
++         * At most 30 s, then retired anyway.
++         */
++        int waited = 0;
++        for (; waited < 300; waited++) {
++            bool held = false;
++            OSIterator *ci = f->getClientIterator();
++            if (ci != nullptr) {
++                for (OSObject *c; (c = ci->getNextObject()) != nullptr; )
++                    if (c->metaCast("IOFramebufferUserClient") != nullptr) { held = true; break; }
++                ci->release();
++            }
++            if (held) break;
++            IOSleep(100);
++        }
++        nmx_trace("publish: retire: waited for WindowServer on it (100 ms steps, 300 = gave up)", (long)waited);
+         nmx_trace("publish: retire: terminate requested", (long)i);
+         f->terminate();
+         nmx_trace("publish: retire: terminate returned", (long)i);

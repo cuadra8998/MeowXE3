@@ -1,0 +1,82 @@
+From 833ab17a2524a304b0fd6de3232db642bc0226ec Mon Sep 17 00:00:00 2001
+From: MeowXE3 <meowxe3@localhost>
+Date: Mon, 16 Nov 2026 13:56:29 -0800
+Subject: [PATCH] NMXAccel: frame copy with memcpy (debug.nvaccel_iop_fastcopy)
+ and copy/flip timers
+
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 31 ++++++++++++++++++++++++++-----
+ 1 file changed, 26 insertions(+), 5 deletions(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index c377c83..a61ff84 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -998,6 +998,9 @@ public:
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
+ static SInt64 gCntIopPanelFlips;   // NMXGPU's panel: frames flipped on at vertical blank
++static SInt64 gCntIopCopyUs;       // MeowXE3: microseconds spent copying frames into the panel buffer (total)
++static SInt64 gCntIopFlipUs;       // MeowXE3: microseconds spent in nmxScanoutFlip (total)
++static int gIopFastCopy = 1;       // MeowXE3: 1 = memcpy rows (vectorised), 0 = the volatile word loop
+ static const OSSymbol *gSymScanBack = nullptr, *gSymScanFlip = nullptr;   // NMXGPU's panel flips
+ static SInt64 gCntIopOkHead[kNvMaxFB];
+ #define NVIOP_LOG_MAX 40
+@@ -1283,16 +1286,30 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
+     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+-    for (unsigned y = 0; y < h; y++) {
+-        const volatile unsigned int *sp = src + (unsigned long)y * spr;
+-        volatile unsigned int *dp = d + (unsigned long)y * dpr;
+-        for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
++    const uint64_t tCopy = mach_absolute_time();
++    if (gIopFastCopy) {
++        // MeowXE3: both sides are ordinary kernel mappings of memory (the IOSurface in system RAM, the panel buffer in
++        // stolen memory); memcpy moves them in wide stores instead of 2 million volatile 32-bit ones per 1080p frame
++        if (spr == dpr && words == spr)
++            memcpy((void *)d, (const void *)src, (size_t)h * pitch);
++        else
++            for (unsigned y = 0; y < h; y++)
++                memcpy((void *)(d + (unsigned long)y * dpr), (const void *)(src + (unsigned long)y * spr), (size_t)words * 4);
++    } else {
++        for (unsigned y = 0; y < h; y++) {
++            const volatile unsigned int *sp = src + (unsigned long)y * spr;
++            volatile unsigned int *dp = d + (unsigned long)y * dpr;
++            for (unsigned x = 0; x < words; x++) dp[x] = sp[x];
++        }
+     }
++    OSAddAtomic64((SInt64)((mach_absolute_time() - tCopy) / 1000), &gCntIopCopyUs);   // x86: the timebase is ns
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+ #ifdef NMX_ACCEL
+     if (toBack) {
++        const uint64_t tFlip = mach_absolute_time();
+         if (fb->callPlatformFunction(symFlip, false, nullptr, nullptr, nullptr, nullptr) == kIOReturnSuccess)
+             OSAddAtomic64(1, &gCntIopPanelFlips);
++        OSAddAtomic64((SInt64)((mach_absolute_time() - tFlip) / 1000), &gCntIopFlipUs);
+         fromRes = true;   // no front-buffer re-copy of this frame: it was flipped, not written onto the panel
+     }
+     // the copy source of a VM display becomes its front buffer (a resource's memory can go away under us: not those)
+@@ -1406,6 +1423,10 @@ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced fr
+ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+ static SInt64 gCntIopCopySkip;
+ NVACCEL_CNT(nvaccel_iop_panel_flips,  gCntIopPanelFlips,  "NMXGPU's panel: frames copied into the back buffer and flipped on at vertical blank");
++NVACCEL_CNT(nvaccel_iop_copy_us,      gCntIopCopyUs,      "MeowXE3: total microseconds copying frames into the panel buffer");
++NVACCEL_CNT(nvaccel_iop_flip_us,      gCntIopFlipUs,      "MeowXE3: total microseconds in nmxScanoutFlip (includes waiting for vertical blank)");
++SYSCTL_INT(_debug, OID_AUTO, nvaccel_iop_fastcopy, CTLFLAG_RW | CTLFLAG_LOCKED, &gIopFastCopy, 0,
++           "MeowXE3: 1 = copy frames with memcpy, 0 = the original volatile 32-bit loop");
+ NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
+ static int    gIopFlip = 0;
+ static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
+@@ -1502,7 +1523,7 @@ static void nmxInstallVmSysctls(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
+-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_panel_flips);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_panel_flips);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip); sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_us); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_us); sysctl_register_oid(&sysctl__debug_nvaccel_iop_fastcopy);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
+-- 
+2.50.1 (Apple Git-155)
+

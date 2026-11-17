@@ -1,0 +1,118 @@
+Subject: [PATCH 0057] LinuxKPI: pci_iounmap() releases a shared BAR mapping only for its last user
+
+Wildcat Lake test start 4 (0055 checkpoints, 0056 page check) showed BAR0 fully mapped when xe mapped it
+("BAR 0x10 (16384 KiB): pages missing as mapped 0 ... -> as mapped"), yet the same page fault followed:
+  write to BAR0 + 0xa188 (FORCEWAKE_GT) in xe_mmio_write32 <- xe_force_wake_get <- xe_gt_init_hwconfig
+Between the two, xe_pci_probe -> xe_display_probe runs the i915 display code's probe_gmdid_display(), which does
+pci_iomap_range(pdev, 0, GMD_ID_DISPLAY, 4), reads one register and pci_iounmap()s it. LinuxKPI keeps one
+pci_mmio_region per BAR and handed xe's BAR0 region to that call; pci_iounmap() then released it, unmapping xe's
+registers under it. On Linux each pci_iomap_range() is a mapping of its own. (ericek's VF guest had no display, so
+this probe never ran there.) Upstream FreeBSD LinuxKPI (d2145e9b) behaves the same.
+
+- override/src/linux_pci.c: the extra users of a shared region are counted (_lkpi_pci_iomap's duplicate branch);
+  linuxkpi_pci_iounmap() drops one user and releases the region only when it was the last; pci_release_region
+  forgets the count of a region it frees.
+
+Applies on top of 0051-0056.
+
+diff --git a/gpu-port/xkpi/override/src/linux_pci.c b/gpu-port/xkpi/override/src/linux_pci.c
+--- a/gpu-port/xkpi/override/src/linux_pci.c
++++ b/gpu-port/xkpi/override/src/linux_pci.c
+@@ -965,8 +965,72 @@
+ 
+ 	/* This is the Linux default. */
+ 	return (dr->mmio_table);
++}
++
++/*
++ * NullMoth: LinuxKPI keeps one pci_mmio_region per BAR and hands it to every pci_iomap*() of that BAR, but
++ * pci_iounmap() released it for whichever caller came first. On Linux each pci_iomap_range() is a mapping of its own.
++ * xe maps BAR0 for its registers; the i915 display code it compiles then maps one register of BAR0 to read the
++ * display GMD_ID and unmaps it (probe_gmdid_display), which unmapped xe's registers too: the next register write
++ * (FORCEWAKE_GT, from xe_gt_init_hwconfig) faulted on a page that was gone (Wildcat Lake, first bare-metal starts).
++ * The extra users of a shared region are counted here; pci_iounmap() releases it only when it was the last one.
++ */
++struct nmx_mmio_ref {
++	TAILQ_ENTRY(nmx_mmio_ref)	next;
++	struct pci_mmio_region		*mmio;
++	int				extra;
++};
++static TAILQ_HEAD(, nmx_mmio_ref) nmx_mmio_refs = TAILQ_HEAD_INITIALIZER(nmx_mmio_refs);
++
++static void
++nmx_mmio_ref_get(struct pci_mmio_region *mmio)
++{
++	struct nmx_mmio_ref *r;
++
++	TAILQ_FOREACH(r, &nmx_mmio_refs, next) {
++		if (r->mmio == mmio) {
++			r->extra++;
++			return;
++		}
++	}
++	r = malloc(sizeof(*r), M_DEVBUF, M_WAITOK | M_ZERO);
++	r->mmio = mmio;
++	r->extra = 1;
++	TAILQ_INSERT_TAIL(&nmx_mmio_refs, r, next);
++}
++
++/* true when another user still holds the region (one user is dropped); false when the caller was the last */
++static bool
++nmx_mmio_ref_put(struct pci_mmio_region *mmio)
++{
++	struct nmx_mmio_ref *r;
++
++	TAILQ_FOREACH(r, &nmx_mmio_refs, next) {
++		if (r->mmio == mmio) {
++			if (--r->extra == 0) {
++				TAILQ_REMOVE(&nmx_mmio_refs, r, next);
++				free(r, M_DEVBUF);
++			}
++			return (true);
++		}
++	}
++	return (false);
+ }
+ 
++/* the region goes regardless (pci_release_region): forget its count */
++static void
++nmx_mmio_ref_forget(struct pci_mmio_region *mmio)
++{
++	struct nmx_mmio_ref *r, *t;
++
++	TAILQ_FOREACH_SAFE(r, &nmx_mmio_refs, next, t) {
++		if (r->mmio == mmio) {
++			TAILQ_REMOVE(&nmx_mmio_refs, r, next);
++			free(r, M_DEVBUF);
++		}
++	}
++}
++
+ static struct resource *
+ _lkpi_pci_iomap(struct pci_dev *pdev, int bar, unsigned long maxlen __unused)
+ {
+@@ -989,6 +1053,7 @@
+ 	 */
+ 	TAILQ_FOREACH_SAFE(mmio, &pdev->mmio, next, p) {
+ 		if (mmio->type == type && mmio->rid == PCIR_BAR(bar)) {
++			nmx_mmio_ref_get(mmio);	/* NullMoth: one more user */
+ 			return (mmio->res);
+ 		}
+ 	}
+@@ -1083,6 +1148,8 @@
+ 				  rman_get_size(mmio->res))
+ 				continue;
+ 		}
++		if (nmx_mmio_ref_put(mmio))	/* NullMoth: another user still maps this BAR */
++			return;
+ 		bus_release_resource(pdev->dev.bsddev,
+ 		    mmio->type, mmio->rid, mmio->res);
+ 		TAILQ_REMOVE(&pdev->mmio, mmio, next);
+@@ -1485,6 +1552,7 @@
+ 	TAILQ_FOREACH_SAFE(mmio, &pdev->mmio, next, p) {
+ 		if (rle->res != (void *)rman_get_bushandle(mmio->res))
+ 			continue;
++		nmx_mmio_ref_forget(mmio);	/* NullMoth: the region goes, and its count with it */
+ 		TAILQ_REMOVE(&pdev->mmio, mmio, next);
+ 		free(mmio, M_DEVBUF);
+ 	}

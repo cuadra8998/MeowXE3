@@ -1,0 +1,137 @@
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 59c9a58..3320948 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -223,6 +223,41 @@ edit("xe_pci.c", [
+     ("	{ 3000, &media_xe2 },\n",
+      "	{ 3000, &media_xe2 },\n	{ 3002, &media_xe2 },\n", 1),
+ ])
++# NullMoth on an integrated GPU (Wildcat Lake): the display bridge needs its scan-out buffer to be one physical run,
++# which VRAM is on a discrete GPU but system RAM is not. While the bridge creates it (nmx_fb_want_stolen set by
++# override/src/nmx_fb_bridge.c), a dumb buffer on an IGP goes into stolen memory, GGTT-mapped (so contiguous), as
++# Linux's own fbdev does (display/intel_fbdev_fb.c); Xe2+/Xe3 reach stolen directly through BAR2. Falls back to the
++# usual placement if stolen is full.
++edit("xe_bo.c", [(
++    "\tbo = xe_bo_create_user(xe, NULL, NULL, args->size,\n"
++    "\t\t\t       DRM_XE_GEM_CPU_CACHING_WC,\n"
++    "\t\t\t       XE_BO_FLAG_VRAM_IF_DGFX(xe_device_get_root_tile(xe)) |\n"
++    "\t\t\t       XE_BO_FLAG_SCANOUT |\n"
++    "\t\t\t       XE_BO_FLAG_NEEDS_CPU_ACCESS);\n",
++    "\tbo = NULL;\n"
++    "\tif (nmx_fb_want_stolen && !IS_DGFX(xe) && !xe_ttm_stolen_cpu_access_needs_ggtt(xe)) {\n"
++    "\t\tbo = xe_bo_create_user(xe, NULL, NULL, args->size,\n"
++    "\t\t\t\t       DRM_XE_GEM_CPU_CACHING_WC,\n"
++    "\t\t\t\t       XE_BO_FLAG_STOLEN | XE_BO_FLAG_GGTT |\n"
++    "\t\t\t\t       XE_BO_FLAG_SCANOUT |\n"
++    "\t\t\t\t       XE_BO_FLAG_NEEDS_CPU_ACCESS);\n"
++    "\t\tif (IS_ERR(bo)) {\n"
++    "\t\t\tdrm_info(&xe->drm, \"NullMoth: scan-out buffer in stolen memory failed (%ld)\\n\", PTR_ERR(bo));\n"
++    "\t\t\tbo = NULL;\n"
++    "\t\t} else {\n"
++    "\t\t\tdrm_info(&xe->drm, \"NullMoth: scan-out buffer in stolen memory\\n\");\n"
++    "\t\t}\n"
++    "\t}\n"
++    "\tif (bo == NULL)\n"
++    "\t\tbo = xe_bo_create_user(xe, NULL, NULL, args->size,\n"
++    "\t\t\t\t       DRM_XE_GEM_CPU_CACHING_WC,\n"
++    "\t\t\t\t       XE_BO_FLAG_VRAM_IF_DGFX(xe_device_get_root_tile(xe)) |\n"
++    "\t\t\t\t       XE_BO_FLAG_SCANOUT |\n"
++    "\t\t\t\t       XE_BO_FLAG_NEEDS_CPU_ACCESS);\n", 1),
++    ("int xe_bo_dumb_create(struct drm_file *file_priv,\n",
++     "extern int nmx_fb_want_stolen;\t/* override/src/nmx_fb_bridge.c */\n\nint xe_bo_dumb_create(struct drm_file *file_priv,\n", 1),
++])
++
+ print("xe fork applied")
+ 
+ # debug.nmxgpu_dump (override/xe/nmx_xe_debug.c): the probed device prints its GuC, queue and fence state on demand
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+index 3d7bb9b..2a81502 100644
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -44,6 +44,12 @@ static struct { void *dev; struct nmx_fb *fb; } fbs[MAX_FB];
+  */
+ extern int amdgpu_sg_display;
+ 
++/*
++ * Set while the bridge creates its scan-out buffer: xe then puts a dumb buffer on an integrated GPU in stolen memory,
++ * the only memory there that is one physical run (fork_xe.py, xe_bo_dumb_create). Other drivers ignore it.
++ */
++int nmx_fb_want_stolen;
++
+ void nmx_fb_before_attach(void)
+ {
+     amdgpu_sg_display = 0;
+@@ -180,7 +186,9 @@ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
+         goto fail;
+     }
+ 
++    nmx_fb_want_stolen = 1;
+     fb->buffer = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
++    nmx_fb_want_stolen = 0;
+     if (IS_ERR(fb->buffer)) {
+         err = -PTR_ERR(fb->buffer);
+         fb->buffer = NULL;
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index 64ca853..a97943d 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -8,6 +8,8 @@
+  * same WindowServer.
+  */
+ #include <IOKit/IOLib.h>
++#include <IOKit/IORegistryEntry.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <IOKit/IODeviceMemory.h>
+ #include <kern/thread_call.h>
+@@ -214,6 +216,42 @@ public:
+ };
+ OSDefineMetaClassAndStructors(NMXGPUFB, IOFramebuffer)
+ 
++/*
++ * The firmware's boot display on the same GPU: on a hackintosh with no graphics kext macOS drives it with
++ * IONDRVFramebuffer, drawing into the GOP buffer. Once this driver has relit the outputs with its own buffer that
++ * framebuffer shows nothing, and WindowServer would keep it as a phantom display drawing into memory the GPU driver
++ * has freed (an integrated GPU's stolen memory). Retire it the way a removed display goes away. Boot argument
++ * -nmxkeepndrv keeps it.
++ */
++static void retire_boot_framebuffer(IOService *gpu, IOService *mine)
++{
++    int dummy = 0;
++    if (PE_parse_boot_argn("-nmxkeepndrv", &dummy, sizeof(dummy)))
++        return;
++    IOService *pci = gpu->getProvider();
++    if (pci == nullptr)
++        return;
++    OSArray *victims = OSArray::withCapacity(2);
++    IORegistryIterator *it = IORegistryIterator::iterateOver(pci, gIOServicePlane, kIORegistryIterateRecursively);
++    if (it == nullptr || victims == nullptr) {
++        OSSafeReleaseNULL(it);
++        OSSafeReleaseNULL(victims);
++        return;
++    }
++    for (IORegistryEntry *e; (e = it->getNextObject()) != nullptr; ) {
++        IOFramebuffer *f = OSDynamicCast(IOFramebuffer, e);
++        if (f != nullptr && f != mine && strstr(f->getMetaClass()->getClassName(), "NDRV") != nullptr)
++            victims->setObject(f);
++    }
++    it->release();
++    for (unsigned i = 0; i < victims->getCount(); i++) {
++        IOService *f = (IOService *)victims->getObject(i);
++        FBLOG("retiring the boot framebuffer %s", f->getMetaClass()->getClassName());
++        f->terminate();
++    }
++    victims->release();
++}
++
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
+ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+ {
+@@ -236,6 +274,7 @@ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+         return nullptr;
+     }
+     fb->registerService();
++    retire_boot_framebuffer(gpu, fb);
+     return fb;
+ }
+ 

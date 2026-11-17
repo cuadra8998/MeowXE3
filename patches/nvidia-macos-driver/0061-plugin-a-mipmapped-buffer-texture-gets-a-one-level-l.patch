@@ -1,0 +1,39 @@
+From 0968452c9683273c09a078d572b3b5842d098c2d Mon Sep 17 00:00:00 2001
+From: MeowXE3 <meowxe3@localhost>
+Date: Tue, 17 Nov 2026 03:18:00 -0800
+Subject: [PATCH] plugin: a mipmapped buffer texture gets a one-level live view
+ instead of nil (Dock badges, login picture); NVMTL_NO_BUFTEX_MIP1=1 for the
+ old nil
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLObjects.m | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index 12cca66..c61bd3f 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -788,7 +788,18 @@ - (IOSurfaceRef)iosurface { return NULL; }
+     if (!d) return nil;
+     if (d.textureType == MTLTextureTypeTextureBuffer) return nvmtl_texbuf_make(self, d, offset);
+     size_t w = d.width, h = d.height;
+-    if (d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 || d.sampleCount > 1 || d.arrayLength > 1 || d.depth > 1
++    /* WindowServer asks for Dock badges and the login picture as buffer textures with a full mip chain (54x54 mips 6, 144x144
++       mips 8). A linear buffer view has one level; nil left those layers blank. Build the one-level live view instead: it reports
++       mipmapLevelCount 1, every level > 0 read, write, copy or mip generation is already refused, sampling uses level 0.
++       NVMTL_NO_BUFTEX_MIP1=1 keeps the old nil. */
++    static int mip1 = -1;
++    if (mip1 < 0) { const char *e = getenv("NVMTL_NO_BUFTEX_MIP1"); mip1 = !(e && e[0] == '1');
++        nvlog("buffer texture: a mipmapped request %s (NVMTL_NO_BUFTEX_MIP1=%s)", mip1 ? "gets a one-level view" : "gets nil (OLD)", e ? e : "unset"); }
++    if (mip1 && d.mipmapLevelCount > 1 && d.textureType == MTLTextureType2D) {
++        static _Atomic uint64_t n; const uint64_t k = atomic_fetch_add(&n, 1) + 1;
++        if (!(k & (k - 1))) nvlog("buffer newTextureWithDescriptor: %zux%zu asked for %lu mips -> one-level view (%llu so far)", w, h,
++                                  (unsigned long)d.mipmapLevelCount, (unsigned long long)k);
++    } else if (d.textureType != MTLTextureType2D || d.mipmapLevelCount > 1 || d.sampleCount > 1 || d.arrayLength > 1 || d.depth > 1
+         || !w || !h || w > UINT32_MAX || h > UINT32_MAX) {
+         nvlog("buffer newTextureWithDescriptor:offset:%lu bytesPerRow:%lu: type %lu %zux%zu (mips %lu, samples %lu, array %lu, depth %lu) "
+               "is not built - only a 2D single-level linear view -> nil", (unsigned long)offset, (unsigned long)bpr, (unsigned long)d.textureType,
+-- 
+2.50.1 (Apple Git-155)
+

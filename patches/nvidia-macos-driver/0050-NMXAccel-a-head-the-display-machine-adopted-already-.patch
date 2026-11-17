@@ -1,0 +1,75 @@
+From 9c69cdef9e0b3cdedb60fce80a36a4fb006dd628 Mon Sep 17 00:00:00 2001
+From: nmx <nmx@local>
+Date: Sun, 15 Nov 2026 22:11:10 -0800
+Subject: [PATCH] NMXAccel: a head the display machine adopted already counts
+ as piped (NMXGPU's panel)
+
+Wildcat Lake, first GPU-compositing boot: WindowServer's AGDC 0x980 rescan made the display machine adopt
+NMXIntelGPUFB itself (displayModeDidChange, its resource over the live scan-out) about 1 s before WindowServer's open
+reached phase 2. found_framebuffer then left the count at 1, registerPendingLocked took that for a refusal, and phase 2
+stopped without framebuffer_did_power_on: every transaction was refused and frames reached the panel only by the
+60 Hz front-buffer copy. When the count does not grow, the pipe whose framebuffer is this head is now taken as the
+head's pipe.
+---
+ kexts/NMXAGDC/nmx-agdc.cpp      |  4 ++--
+ kexts/NVRM/accel/nvrm-accel.cpp | 22 ++++++++++++++++++++++
+ 2 files changed, 24 insertions(+), 2 deletions(-)
+
+diff --git a/kexts/NMXAGDC/nmx-agdc.cpp b/kexts/NMXAGDC/nmx-agdc.cpp
+index a063301..6e682f9 100644
+--- a/kexts/NMXAGDC/nmx-agdc.cpp
++++ b/kexts/NMXAGDC/nmx-agdc.cpp
+@@ -206,7 +206,7 @@ static void nvdaAgdcTargets(IOService **pci, IOService **fb)
+     // registering, when a matching lookup does not find it yet; the lookups below are the fallback
+     IOService *f = gAgdcHintFB, *p = gAgdcHintPCI;
+     if (f && p && p->metaCast("IOPCIDevice")) { f->retain(); gAgdcFBRef = f; *fb = f; *pci = p; return; }
+-    OSDictionary *m = IOService::serviceMatching("NMXVGAFB"); if (!m) return;
++    OSDictionary *m = IOService::serviceMatching("NMXIntelGPUFB"); if (!m) return;
+     f = IOService::copyMatchingService(m); m->release(); if (!f) return;
+     OSDictionary *g = IOService::serviceMatching("NMXGPU"); IOService *gpu = g ? IOService::copyMatchingService(g) : nullptr;
+     OSSafeReleaseNULL(g);
+@@ -221,7 +221,7 @@ static void nvdaAgdcScan(IOService *pci)
+ {
+     nvdaAgdcDropTable(); gAgdcScanLogged = 0;
+     IOService *tab[kAgdcMaxFB] = {}; unsigned seen = 0, noidx = 0, range = 0, dup = 0, other = 0, hole = 0;
+-    OSDictionary *m = IOService::serviceMatching("NMXVGAFB");
++    OSDictionary *m = IOService::serviceMatching("NMXIntelGPUFB");
+     OSIterator *it = m ? IOService::getMatchingServices(m) : nullptr; OSSafeReleaseNULL(m);
+     if (!it) { snprintf(gAgdcFBMap, sizeof gAgdcFBMap, "n=0 (no iterator: the earlier one-head reply)"); FBLOG("AGDC: slot table %s", gAgdcFBMap); return; }
+     OSObject *o;
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index f19c47b..f1f1dcf 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -420,6 +420,28 @@ public:
+             unsigned c = fDM->getFramebufferCount();
+             fFBRegistered |= 1u << i;
+             gNvHeadsRegistered = fFBRegistered;
++#ifdef NMX_ACCEL
++            // NMXGPU's panel (NMXIntelGPUFB): the display machine may have adopted the framebuffer itself already, when
++            // WindowServer's AGDC 0x980 rescan listed it ("DM: displayModeDidChange", its resource over the live
++            // scan-out), ~1 s before WindowServer's open reaches phase 2. found_framebuffer then adds nothing; the
++            // pipe that drives this framebuffer is the head's pipe (Wildcat Lake: count 1 -> 1, and phase 2 stopped
++            // without powering the pipe on, so every transaction was refused and frames reached the panel by copy).
++            if (c == b && b > 0 && b <= 16) {
++                uint8_t *dm0 = (uint8_t *)fDM;
++                unsigned found = 16;
++                for (unsigned s = 0; s < b && found == 16; s++) {
++                    void *pp = *(void *const volatile *)(dm0 + 0x88 + 8 * s);
++                    if (pp && *(IOService *const volatile *)((const uint8_t *)pp + 0x98) == fb) found = s;
++                }
++                if (found != 16) {
++                    ALOG("  %s: index %u -- already adopted by the display machine: pipe %u drives %s, count %u",
++                         why, i, found, fb->getName(), c);
++                    gNvHeadsPiped |= 1u << i;
++                    added++;
++                    continue;
++                }
++            }
++#endif
+             if (c != b + 1) {
+                 ALOG("  %s: index %u -- count went %u -> %u; the family did not add it (already known, or the cap "
+                      "accel+0xcb0 = %u refused it). Stopping here so no later head takes this one's pipe number.",
+-- 
+2.50.1 (Apple Git-155)
+

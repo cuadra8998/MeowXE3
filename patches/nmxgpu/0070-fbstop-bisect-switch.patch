@@ -1,0 +1,111 @@
+Subject: [PATCH 0070] Debug switch nullmoth-fbstop: modeset without publishing, or publishing without the modeset
+
+Wildcat Lake test start 14 (0069 heartbeat): "t=12 irqs=55 rate=51" was the last heartbeat (no interrupt storm: a
+normal vblank rate) and "publish: start: done" the last breadcrumb: the Mac froze 2-4 s after the panel modeset,
+again at a different point of the publish. This separates the display side from the macOS side.
+
+- xnu/nmx_fb.cpp: NVRAM nullmoth-fbstop=1 stops nmx_fb_publish after nmx_fb_open (modeset done, panel driven by xe
+  from NullMoth's buffer, no IOFramebuffer); nullmoth-fbstop=2 makes nmx_fb_open skip the modeset commit and publishes.
+- override/src/nmx_fb_bridge.c: nmx_fb_skip_commit.
+- xnu/nmx_kext.cpp: nmx_xnu_nvram_int(key).
+Set with  sudo nvram nullmoth-fbstop=1 ; clear with  sudo nvram -d nullmoth-fbstop
+
+Applies on top of 0051-0069.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -266,12 +266,27 @@
+ }
+ 
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
++extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
++extern "C" int nmx_fb_skip_commit;                     /* override/src/nmx_fb_bridge.c */
++
++/*
++ * Bring-up bisection (Wildcat Lake: after the first panel modeset the whole Mac froze a few seconds later, wherever
++ * the publish was): NVRAM nullmoth-fbstop=1 does the modeset and stops before any IOFramebuffer exists (the panel stays
++ * driven by xe from this buffer); nullmoth-fbstop=2 publishes the IOFramebuffer without the modeset. Unset: normal.
++ */
+ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+ {
+     nmx_fb_info info;
+-    nmx_trace("publish: nmx_fb_open", 0);
++    int fbstop = nmx_xnu_nvram_int("nullmoth-fbstop");
++    nmx_fb_skip_commit = fbstop == 2;
++    nmx_trace("publish: nmx_fb_open (fbstop)", fbstop);
+     int err = nmx_fb_open(dev, &info);
+     nmx_trace("publish: nmx_fb_open (err)", err);
++    if (fbstop == 1 && !err && info.ok) {
++        FBLOG("nullmoth-fbstop=1: modeset done, no IOFramebuffer published");
++        nmx_trace("publish: stopped after the modeset (nullmoth-fbstop=1)", 0);
++        return nullptr;
++    }
+     if (err || !info.ok) {
+         FBLOG("no framebuffer (%d)", err);
+         return nullptr;
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -134,6 +134,9 @@
+ 
+ void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
+ 
++/* debug (nullmoth-fbstop=2, set by xnu/nmx_fb.cpp): everything but the modeset commit */
++int nmx_fb_skip_commit;
++
+ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
+ {
+     device_t dev = devp;
+@@ -239,8 +242,8 @@
+         if (ms->mode != NULL)
+             ms->fb = fb->buffer->fb;
+     mutex_unlock(&fb->client.modeset_mutex);
+-    nmx_trace("fb: drm_client_modeset_commit", 0);
+-    err = -drm_client_modeset_commit(&fb->client);
++    nmx_trace("fb: drm_client_modeset_commit (skipped)", nmx_fb_skip_commit);
++    err = nmx_fb_skip_commit ? 0 : -drm_client_modeset_commit(&fb->client);
+     nmx_trace("fb: modeset commit (err)", err);
+     if (err) {
+         printf("NullMoth display: the mode set failed (%d)\n", err);
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -242,7 +242,37 @@
+     if (k)
+         k->release();
+     n->sync();
++    n->release();
++}
++
++/* an NVRAM variable as a number (its data parsed as decimal text, or its first byte); 0 when absent */
++extern "C" int nmx_xnu_nvram_int(const char *key)
++{
++    IODTNVRAM *n = nmx_nvram();
++    if (n == nullptr || key == nullptr) {
++        if (n)
++            n->release();
++        return 0;
++    }
++    int v = 0;
++    if (OSObject *o = n->copyProperty(key)) {
++        if (OSData *d = OSDynamicCast(OSData, o)) {
++            const char *b = (const char *)d->getBytesNoCopy();
++            unsigned len = d->getLength();
++            bool text = len > 0;
++            for (unsigned i = 0; i < len && text; i++)
++                if (b[i] < '0' || b[i] > '9')
++                    text = false;
++            if (text)
++                for (unsigned i = 0; i < len; i++)
++                    v = v * 10 + (b[i] - '0');
++            else if (len > 0)
++                v = (unsigned char)b[0];
++        }
++        o->release();
++    }
+     n->release();
++    return v;
+ }
+ 
+ extern "C" void nmx_xnu_trace_breadcrumb(const char *step)

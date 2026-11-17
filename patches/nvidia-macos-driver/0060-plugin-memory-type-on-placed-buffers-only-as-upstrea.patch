@@ -1,0 +1,36 @@
+From 4af776659a70804ac40d2068cd96ab1415729c40 Mon Sep 17 00:00:00 2001
+From: MeowXE3 <meowxe3@localhost>
+Date: Tue, 17 Nov 2026 03:07:07 -0800
+Subject: [PATCH 60/60] plugin: memory type on placed buffers only, as upstream
+ 8bb6ba6 (images have no such field)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/nvmtl_vk.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index e647d6a..b776c69 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -7275,7 +7275,7 @@ static int nvmtl_vk_image_create_typed_placed_lifetime_body(uint32_t w, uint32_t
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+     if (placed_ok(&mr, heap, offset, "placed image")) { pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
+     VKCK(pvkBindImageMemory(g_dev, out->img, (VkDeviceMemory)heap->mem, offset), "vkBindImageMemory(placed)");
+-    out->mem = heap->mem; out->placed = 1; out->alloc = 0; out->memtype1 = heap->memtype + 1;   /* NullMoth 8bb6ba6 (i-120) */
++    out->mem = heap->mem; out->placed = 1; out->alloc = 0;
+     VkComponentMapping swz = a8 ? (VkComponentMapping){ VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R }
+                                 : (VkComponentMapping){ 0, 0, 0, 0 };
+     VkImageViewType viewType = mtl_type == 0 ? VK_IMAGE_VIEW_TYPE_1D : mtl_type == 1 ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : mtl_type == 3 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+@@ -7307,7 +7307,7 @@ static int nvmtl_vk_depth_create_ex_placed_lifetime_body(uint32_t w, uint32_t h,
+     VkMemoryRequirements mr; pvkGetImageMemoryRequirements(g_dev, out->img, &mr);
+     if (placed_ok(&mr, heap, offset, "placed depth image")) { pvkDestroyImage(g_dev, (VkImage)out->img, NULL); memset(out, 0, sizeof *out); return -1; }
+     VKCK(pvkBindImageMemory(g_dev, out->img, (VkDeviceMemory)heap->mem, offset), "vkBindImageMemory(placed depth)");
+-    out->mem = heap->mem; out->placed = 1; out->alloc = 0; out->memtype1 = heap->memtype + 1;   /* NullMoth 8bb6ba6 (i-120) */
++    out->mem = heap->mem; out->placed = 1; out->alloc = 0;
+     VkImageViewCreateInfo vci = { VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, NULL, 0, out->img, VK_IMAGE_VIEW_TYPE_2D,
+         (VkFormat)vkfmt, { 0 }, { (VkImageAspectFlags)aspect, 0, 1, 0, 1 } };
+     VKCK(nvmtl_opaque_CreateImageView(g_dev, &vci, NULL, &out->view), "vkCreateImageView(placed depth)");
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,56 @@
+From 698582c982c212aaabb3cbf4919f3b944431efeb Mon Sep 17 00:00:00 2001
+From: MeowXE3 <meowxe3@localhost>
+Date: Mon, 16 Nov 2026 14:32:38 -0800
+Subject: [PATCH] plugin: no soft VRAM gate on unified memory (integrated GPU):
+ it failed every texture once Minecraft ran
+
+---
+ plugin/nvmtl_vk.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/plugin/nvmtl_vk.c b/plugin/nvmtl_vk.c
+index 4244905..88a7ba7 100644
+--- a/plugin/nvmtl_vk.c
++++ b/plugin/nvmtl_vk.c
+@@ -1634,10 +1634,38 @@ static int nvmtl_vk_vram_wall(uint64_t want, uint64_t *freev_out, uint64_t *bud_
+     if (measured_out) *measured_out = ms;
+     return gate;
+ }
++/*
++ * MeowXE3: a GPU whose every memory type is device-local shares system RAM (an integrated GPU: Intel Xe3 under ANV).
++ * There is no VRAM to keep headroom in and no system-memory type to spill to, so the soft gate below only turned
++ * allocations into failures: with Minecraft running, every WindowServer texture failed ("no system-memory type takes
++ * it (bits 0x7) -> -2") and the desktop froze. On such a GPU the gate is off and the driver's own answer stands.
++ * NVMTL_UNIFIED_GATE=1 keeps the gate anyway.
++ */
++static int nvmtl_vk_unified(void)
++{
++    static int u = -1;
++    if (u < 0 && g_memp.memoryTypeCount) {
++        const char *e = getenv("NVMTL_UNIFIED_GATE");
++        u = 1;
++        for (uint32_t i = 0; i < g_memp.memoryTypeCount; i++)
++            if (!(g_memp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) u = 0;
++        if (e && e[0] == '1') u = 0;
++        nvlog("vk: memory %s: %u memory types%s", u ? "UNIFIED (integrated GPU)" : "split (VRAM + system)",
++              g_memp.memoryTypeCount, u ? " - soft VRAM gate off" : "");
++    }
++    return u > 0;
++}
+ static int nvmtl_vk_vram_wall0(uint64_t want, uint64_t *freev_out, uint64_t *bud_out, uint64_t *used_out, int *measured_out)
+ {
+     uint64_t bud = 0, used = 0;
+     int measured = nvmtl_vk_vram_budget(&bud, &used);
++    if (nvmtl_vk_unified()) {
++        if (freev_out) *freev_out = bud > used ? bud - used : 0;
++        if (bud_out) *bud_out = bud;
++        if (used_out) *used_out = used;
++        if (measured_out) *measured_out = measured;
++        return 0;
++    }
+     uint64_t card = nvmtl_vk_vram_bytes();
+     uint64_t inv = bud / 9 * 10;
+     uint64_t freev = card;
+-- 
+2.50.1 (Apple Git-155)
+

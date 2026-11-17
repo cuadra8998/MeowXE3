@@ -1,0 +1,42 @@
+Subject: [PATCH 0097] the GPU's name and graphics memory for System Information (model, VRAM,totalMB)
+
+System Information (SPDisplaysReporter) and About This Mac read the GPU's name from the PCI entry's "model" and its
+memory from "VRAM,totalMB"; with neither, Wildcat Lake showed no name and "VRAM (Total): 7 MB". When NMXGPU drives an
+Intel GPU it now sets "model" = "Intel Graphics" (unless something set one) and VRAM,totalMB as Apple's Intel
+drivers report shared memory: 1536 MB with 8 GB of RAM, 2048 MB with more.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 062aadf..549a8bc 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -16,6 +16,7 @@
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/IONVRAM.h>
+ #include <IOKit/pci/IOPCIDevice.h>
++#include <sys/sysctl.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
+ #include <libkern/c++/OSBoolean.h>
+ #include <libkern/c++/OSData.h>
+@@ -485,6 +486,22 @@ void NMXGPU::attachNow()
+     }
+     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
+     watchBootFramebuffer();
++    /*
++     * What System Information (SPDisplaysReporter) and About This Mac read off the GPU's PCI entry: its name ("model",
++     * shown as the chipset model) and the graphics memory ("VRAM,totalMB"; an integrated GPU's is shared system RAM,
++     * reported as Apple's Intel drivers do: 1536 MB with 8 GB of RAM, 2048 MB with more). Without them the GPU had no
++     * name and "VRAM (Total): 7 MB" (Wildcat Lake). Only when this driver drives the GPU.
++     */
++    if (pci_->configRead16(kIOPCIConfigVendorID) == 0x8086 && pci_->getProperty("model") == nullptr) {
++        static const char kModel[] = "Intel Graphics";
++        if (OSData *m = OSData::withBytes(kModel, sizeof(kModel))) { pci_->setProperty("model", m); m->release(); }
++    }
++    {
++        uint64_t mem = 0; size_t len = sizeof(mem);
++        uint32_t vramMB = (sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0 && mem > (8ull << 30)) ? 2048 : 1536;
++        pci_->setProperty("VRAM,totalMB", vramMB, 32);
++        nmx_trace("attach: published model and VRAM,totalMB", (long)vramMB);
++    }
+     nmx_trace("attach: publishing the framebuffer", 0);
+     fb_ = nmx_fb_publish(this, dev_);
+     nmx_trace("attach: framebuffer published", fb_ != nullptr);

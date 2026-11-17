@@ -1,0 +1,332 @@
+Subject: [PATCH 0062] drm-kmod: checkpoints in the modeset commit (applied to drm-kmod, after 0060)
+
+nmx_trace before each statement-level call in intel_atomic_commit_tail, skl_commit_modeset_enables and
+hsw_crtc_enable, never inside a spinlock/irq-off region (nmxtrace=3 writes NVRAM, which may sleep). Off unless the
+boot argument nmxtrace is set. Noisy once WindowServer draws (every commit passes here): a bring-up aid only.
+
+diff --git a/drivers/gpu/drm/i915/display/intel_display.c b/drivers/gpu/drm/i915/display/intel_display.c
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@ -24,6 +24,7 @@
+  *	Eric Anholt <eric@anholt.net>
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/dma-resv.h>
+ #include <linux/i2c.h>
+ #include <linux/input.h>
+@@ -1797,6 +1798,7 @@
+ 	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i)
+ 		intel_dmc_enable_pipe(display, pipe_crtc->pipe);
+ 
++	nmx_trace("hsw_crtc_enable: intel_encoders_pre_pll_enable", 0);
+ 	intel_encoders_pre_pll_enable(state, crtc);
+ 
+ 	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+@@ -1807,17 +1809,20 @@
+ 			intel_enable_shared_dpll(pipe_crtc_state);
+ 	}
+ 
++	nmx_trace("hsw_crtc_enable: intel_encoders_pre_enable", 0);
+ 	intel_encoders_pre_enable(state, crtc);
+ 
+ 	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+ 		const struct intel_crtc_state *pipe_crtc_state =
+ 			intel_atomic_get_new_crtc_state(state, pipe_crtc);
+ 
++		nmx_trace("hsw_crtc_enable: intel_dsc_enable", 0);
+ 		intel_dsc_enable(pipe_crtc_state);
+ 
+ 		if (HAS_UNCOMPRESSED_JOINER(dev_priv))
+ 			intel_uncompressed_joiner_enable(pipe_crtc_state);
+ 
++		nmx_trace("hsw_crtc_enable: intel_set_pipe_src_size", 0);
+ 		intel_set_pipe_src_size(pipe_crtc_state);
+ 
+ 		if (DISPLAY_VER(dev_priv) >= 9 || IS_BROADWELL(dev_priv))
+@@ -1845,16 +1850,20 @@
+ 		 * On ILK+ LUT must be loaded before the pipe is running but with
+ 		 * clocks enabled
+ 		 */
++		nmx_trace("hsw_crtc_enable: intel_color_modeset", 0);
+ 		intel_color_modeset(pipe_crtc_state);
+ 
++		nmx_trace("hsw_crtc_enable: hsw_set_linetime_wm", 0);
+ 		hsw_set_linetime_wm(pipe_crtc_state);
+ 
+ 		if (DISPLAY_VER(dev_priv) >= 11)
+ 			icl_set_pipe_chicken(pipe_crtc_state);
+ 
++		nmx_trace("hsw_crtc_enable: intel_initial_watermarks", 0);
+ 		intel_initial_watermarks(state, pipe_crtc);
+ 	}
+ 
++	nmx_trace("hsw_crtc_enable: intel_encoders_enable", 0);
+ 	intel_encoders_enable(state, crtc);
+ 
+ 	for_each_pipe_crtc_modeset_enable(display, pipe_crtc, new_crtc_state, i) {
+@@ -1863,7 +1872,9 @@
+ 		enum pipe hsw_workaround_pipe;
+ 
+ 		if (glk_need_scaler_clock_gating_wa(pipe_crtc_state)) {
++			nmx_trace("hsw_crtc_enable: intel_crtc_wait_for_next_vblank", 0);
+ 			intel_crtc_wait_for_next_vblank(pipe_crtc);
++			nmx_trace("hsw_crtc_enable: glk_pipe_scaler_clock_gating_wa", 0);
+ 			glk_pipe_scaler_clock_gating_wa(pipe_crtc, false);
+ 		}
+ 
+@@ -1876,7 +1887,9 @@
+ 			struct intel_crtc *wa_crtc =
+ 				intel_crtc_for_pipe(display, hsw_workaround_pipe);
+ 
++			nmx_trace("hsw_crtc_enable: intel_crtc_wait_for_next_vblank", 0);
+ 			intel_crtc_wait_for_next_vblank(wa_crtc);
++			nmx_trace("hsw_crtc_enable: intel_crtc_wait_for_next_vblank", 0);
+ 			intel_crtc_wait_for_next_vblank(wa_crtc);
+ 		}
+ 	}
+@@ -7419,9 +7432,11 @@
+ 		if ((update_pipes & BIT(pipe)) == 0)
+ 			continue;
+ 
++		nmx_trace("skl_commit_modeset_enables: intel_pre_update_crtc", 0);
+ 		intel_pre_update_crtc(state, crtc);
+ 	}
+ 
++	nmx_trace("skl_commit_modeset_enables: intel_dbuf_mbus_pre_ddb_update", 0);
+ 	intel_dbuf_mbus_pre_ddb_update(state);
+ 
+ 	while (update_pipes) {
+@@ -7443,6 +7458,7 @@
+ 			entries[pipe] = new_crtc_state->wm.skl.ddb;
+ 			update_pipes &= ~BIT(pipe);
+ 
++			nmx_trace("skl_commit_modeset_enables: intel_update_crtc", 0);
+ 			intel_update_crtc(state, crtc);
+ 
+ 			/*
+@@ -7458,6 +7474,7 @@
+ 		}
+ 	}
+ 
++	nmx_trace("skl_commit_modeset_enables: intel_dbuf_mbus_post_ddb_update", 0);
+ 	intel_dbuf_mbus_post_ddb_update(state);
+ 
+ 	update_pipes = modeset_pipes;
+@@ -7481,6 +7498,7 @@
+ 
+ 		modeset_pipes &= ~intel_crtc_joined_pipe_mask(new_crtc_state);
+ 
++		nmx_trace("skl_commit_modeset_enables: intel_enable_crtc", 0);
+ 		intel_enable_crtc(state, crtc);
+ 	}
+ 
+@@ -7499,6 +7517,7 @@
+ 
+ 		modeset_pipes &= ~intel_crtc_joined_pipe_mask(new_crtc_state);
+ 
++		nmx_trace("skl_commit_modeset_enables: intel_enable_crtc", 0);
+ 		intel_enable_crtc(state, crtc);
+ 	}
+ 
+@@ -7511,6 +7530,7 @@
+ 		if ((update_pipes & BIT(pipe)) == 0)
+ 			continue;
+ 
++		nmx_trace("skl_commit_modeset_enables: intel_pre_update_crtc", 0);
+ 		intel_pre_update_crtc(state, crtc);
+ 	}
+ 
+@@ -7530,6 +7550,7 @@
+ 		entries[pipe] = new_crtc_state->wm.skl.ddb;
+ 		update_pipes &= ~BIT(pipe);
+ 
++		nmx_trace("skl_commit_modeset_enables: intel_update_crtc", 0);
+ 		intel_update_crtc(state, crtc);
+ 	}
+ 
+@@ -7726,17 +7747,23 @@
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
+ 		intel_atomic_dsb_prepare(state, crtc);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_atomic_commit_fence_wait", 0);
+ 	intel_atomic_commit_fence_wait(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_td_flush", 0);
+ 	intel_td_flush(dev_priv);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_atomic_prepare_plane_clear_colors", 0);
+ 	intel_atomic_prepare_plane_clear_colors(state);
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i)
+ 		intel_atomic_dsb_finish(state, crtc);
+ 
++	nmx_trace("intel_atomic_commit_tail: drm_atomic_helper_wait_for_dependencies", 0);
+ 	drm_atomic_helper_wait_for_dependencies(&state->base);
++	nmx_trace("intel_atomic_commit_tail: drm_dp_mst_atomic_wait_for_dependencies", 0);
+ 	drm_dp_mst_atomic_wait_for_dependencies(&state->base);
++	nmx_trace("intel_atomic_commit_tail: intel_atomic_global_state_wait_for_dependencies", 0);
+ 	intel_atomic_global_state_wait_for_dependencies(state);
+ 
+ 	/*
+@@ -7766,6 +7793,7 @@
+ 	 * the CSC latched register values with the readout (see
+ 	 * skl_read_csc() and skl_color_commit_noarm()).
+ 	 */
++	nmx_trace("intel_atomic_commit_tail: intel_display_power_get", 0);
+ 	wakeref = intel_display_power_get(dev_priv, POWER_DOMAIN_DC_OFF);
+ 
+ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state,
+@@ -7775,8 +7803,10 @@
+ 			intel_modeset_get_crtc_power_domains(new_crtc_state, &put_domains[crtc->pipe]);
+ 	}
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_commit_modeset_disables", 0);
+ 	intel_commit_modeset_disables(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_dp_tunnel_atomic_alloc_bw", 0);
+ 	intel_dp_tunnel_atomic_alloc_bw(state);
+ 
+ 	/* FIXME: Eventually get rid of our crtc->config pointer */
+@@ -7789,16 +7819,21 @@
+ 	 * index, cdclk/ddiclk frequencies are supposed to be configured before
+ 	 * the cdclk config is set.
+ 	 */
++	nmx_trace("intel_atomic_commit_tail: intel_pmdemand_pre_plane_update", 0);
+ 	intel_pmdemand_pre_plane_update(state);
+ 
+ 	if (state->modeset) {
++		nmx_trace("intel_atomic_commit_tail: drm_atomic_helper_update_legacy_modeset_state", 0);
+ 		drm_atomic_helper_update_legacy_modeset_state(dev, &state->base);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_set_cdclk_pre_plane_update", 0);
+ 		intel_set_cdclk_pre_plane_update(state);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_modeset_verify_disabled", 0);
+ 		intel_modeset_verify_disabled(state);
+ 	}
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_sagv_pre_plane_update", 0);
+ 	intel_sagv_pre_plane_update(state);
+ 
+ 	/* Complete the events for pipes that have now been disabled */
+@@ -7807,6 +7842,7 @@
+ 
+ 		/* Complete events for now disable pipes here. */
+ 		if (modeset && !new_crtc_state->hw.active && new_crtc_state->uapi.event) {
++			nmx_trace("intel_atomic_commit_tail: spin_lock_irq", 0);
+ 			spin_lock_irq(&dev->event_lock);
+ 			drm_crtc_send_vblank_event(&crtc->base,
+ 						   new_crtc_state->uapi.event);
+@@ -7816,8 +7852,10 @@
+ 		}
+ 	}
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_encoders_update_prepare", 0);
+ 	intel_encoders_update_prepare(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_dbuf_pre_plane_update", 0);
+ 	intel_dbuf_pre_plane_update(state);
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+@@ -7828,8 +7866,10 @@
+ 	/* Now enable the clocks, plane, pipe, and connectors that we set up. */
+ 	dev_priv->display.funcs.display->commit_modeset_enables(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_program_dpkgc_latency", 0);
+ 	intel_program_dpkgc_latency(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_wait_for_vblank_workers", 0);
+ 	intel_wait_for_vblank_workers(state);
+ 
+ 	/* FIXME: We should call drm_atomic_helper_commit_hw_done() here
+@@ -7841,12 +7881,14 @@
+ 	 * - switch over to the vblank wait helper in the core after that since
+ 	 *   we don't need out special handling any more.
+ 	 */
++	nmx_trace("intel_atomic_commit_tail: drm_atomic_helper_wait_for_flip_done", 0);
+ 	drm_atomic_helper_wait_for_flip_done(dev, &state->base);
+ 
+ 	for_each_new_intel_crtc_in_state(state, crtc, new_crtc_state, i) {
+ 		if (new_crtc_state->do_async_flip)
+ 			intel_crtc_disable_flip_done(state, crtc);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_atomic_dsb_wait_commit", 0);
+ 		intel_atomic_dsb_wait_commit(new_crtc_state);
+ 	}
+ 
+@@ -7870,18 +7912,24 @@
+ 		if (DISPLAY_VER(dev_priv) == 2 && planes_enabling(old_crtc_state, new_crtc_state))
+ 			intel_set_cpu_fifo_underrun_reporting(dev_priv, crtc->pipe, true);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_optimize_watermarks", 0);
+ 		intel_optimize_watermarks(state, crtc);
+ 	}
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_dbuf_post_plane_update", 0);
+ 	intel_dbuf_post_plane_update(state);
+ 
+ 	for_each_oldnew_intel_crtc_in_state(state, crtc, old_crtc_state, new_crtc_state, i) {
++		nmx_trace("intel_atomic_commit_tail: intel_post_plane_update", 0);
+ 		intel_post_plane_update(state, crtc);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_modeset_put_crtc_power_domains", 0);
+ 		intel_modeset_put_crtc_power_domains(crtc, &put_domains[crtc->pipe]);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_modeset_verify_crtc", 0);
+ 		intel_modeset_verify_crtc(state, crtc);
+ 
++		nmx_trace("intel_atomic_commit_tail: intel_post_plane_update_after_readout", 0);
+ 		intel_post_plane_update_after_readout(state, crtc);
+ 
+ 		/*
+@@ -7896,18 +7944,24 @@
+ 	}
+ 
+ 	/* Underruns don't always raise interrupts, so check manually */
++	nmx_trace("intel_atomic_commit_tail: intel_check_cpu_fifo_underruns", 0);
+ 	intel_check_cpu_fifo_underruns(dev_priv);
++	nmx_trace("intel_atomic_commit_tail: intel_check_pch_fifo_underruns", 0);
+ 	intel_check_pch_fifo_underruns(dev_priv);
+ 
+ 	if (state->modeset)
+ 		intel_verify_planes(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: intel_sagv_post_plane_update", 0);
+ 	intel_sagv_post_plane_update(state);
+ 	if (state->modeset)
+ 		intel_set_cdclk_post_plane_update(state);
++	nmx_trace("intel_atomic_commit_tail: intel_pmdemand_post_plane_update", 0);
+ 	intel_pmdemand_post_plane_update(state);
+ 
++	nmx_trace("intel_atomic_commit_tail: drm_atomic_helper_commit_hw_done", 0);
+ 	drm_atomic_helper_commit_hw_done(&state->base);
++	nmx_trace("intel_atomic_commit_tail: intel_atomic_global_state_commit_done", 0);
+ 	intel_atomic_global_state_commit_done(state);
+ 
+ 	if (state->modeset) {
+@@ -7917,13 +7971,16 @@
+ 		 * so enable debugging for the next modeset - and hope we catch
+ 		 * the culprit.
+ 		 */
++		nmx_trace("intel_atomic_commit_tail: intel_uncore_arm_unclaimed_mmio_detection", 0);
+ 		intel_uncore_arm_unclaimed_mmio_detection(&dev_priv->uncore);
+ 	}
+ 	/*
+ 	 * Delay re-enabling DC states by 17 ms to avoid the off->on->off
+ 	 * toggling overhead at and above 60 FPS.
+ 	 */
++	nmx_trace("intel_atomic_commit_tail: intel_display_power_put_async_delay", 0);
+ 	intel_display_power_put_async_delay(dev_priv, POWER_DOMAIN_DC_OFF, wakeref, 17);
++	nmx_trace("intel_atomic_commit_tail: intel_runtime_pm_put", 0);
+ 	intel_runtime_pm_put(&dev_priv->runtime_pm, state->wakeref);
+ 
+ 	/*
+@@ -7935,6 +7992,7 @@
+ 	 * down.
+ 	 */
+ 	INIT_WORK(&state->cleanup_work, intel_atomic_cleanup_work);
++	nmx_trace("intel_atomic_commit_tail: queue_work", 0);
+ 	queue_work(dev_priv->display.wq.cleanup, &state->cleanup_work);
+ }
+ 

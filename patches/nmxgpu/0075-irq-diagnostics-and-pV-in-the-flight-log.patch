@@ -1,0 +1,295 @@
+Subject: [PATCH 0075] Interrupt diagnostics, and %pV expanded in the flight log
+
+Wildcat Lake flight log of test start 19: NMXGPU's modeset lit the panel (link training passed, pipe A on, backlight
+on); 20 ms after drm_client_register no GPU interrupt was delivered again (count stuck at 57), so the next commit's
+flip_done waited out its 10 s and the start died after it. Also seen: every drm_info/drm_warn/drm_err printed as
+"[drm] 0x...V", because drm_print.c passes them as %pV, which xnu's formatter does not know.
+
+- xnu/nmx_flight.cpp: formats containing %pV are walked conversion by conversion and %pV (struct va_format) is
+  expanded recursively, so drm's info/warning/error messages are readable; other formats are unchanged.
+- xnu/nmx_pci.cpp: the heartbeat shows handler returns next to deliveries (irqs=N done=M: M < N means a handler that
+  never returned) and the GPU's interrupt registers through nmx_irq_state_hook.
+- override/xe/nmx_xe_debug.c: nmx_xe_irq_state() reads (without side effects) DG1_MSTR_TILE_INTR, GFX_MSTR_IRQ, xe's
+  irq.enabled, pipe A's DE ISR/IMR/IIR/IER, the hot-plug ISR/IMR/IIR/IER, GU misc IIR and the display interrupt
+  control; set as the hook when xe registers.
+- fork_xe.py: checkpoints in every step of dg1_irq_handler (lock-aware).
+
+Applies on top of 0051-0074.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+--- a/gpu-port/xkpi/xnu/nmx_flight.cpp
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -98,10 +98,161 @@
+     ring_unlock(st);
+ }
+ 
++/*
++ * Linux's %pV (a struct va_format: a nested format and its va_list), which drm_print.c passes to dev_printk/printk for
++ * every drm_info/drm_warn/drm_err. xnu's formatter does not know it and printed the pointer and a 'V', so those
++ * messages were lost. A format containing %pV is walked here conversion by conversion (each formatted by vsnprintf's
++ * engine with its own argument), and %pV is expanded recursively; any other format goes to vsnprintf unchanged.
++ */
++struct nmx_va_format {
++    const char *fmt;
++    va_list *va;
++};
++
++/* the kernel SDK declares neither strstr nor strchr */
++static bool has_pV(const char *f)
++{
++    for (; *f; f++)
++        if (f[0] == '%' && f[1] == 'p' && f[2] == 'V')
++            return true;
++    return false;
++}
++
++static bool in_set(char c, const char *set)
++{
++    for (; *set; set++)
++        if (*set == c)
++            return true;
++    return false;
++}
++
++static int nmx_vformat(char *out, size_t cap, const char *fmt, va_list ap);
++
++static size_t fmt_put(char *out, size_t cap, size_t pos, const char *s, size_t n)
++{
++    for (size_t i = 0; i < n && pos + 1 < cap; i++)
++        out[pos++] = s[i];
++    if (cap)
++        out[pos < cap ? pos : cap - 1] = '\0';
++    return pos;
++}
++
++static size_t fmt_one(char *out, size_t cap, size_t pos, const char *spec, ...)
++{
++    char tmp[256];
++    va_list a;
++    va_start(a, spec);
++    int n = vsnprintf(tmp, sizeof(tmp), spec, a);
++    va_end(a);
++    if (n < 0)
++        return pos;
++    return fmt_put(out, cap, pos, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp) - 1);
++}
++
++static int nmx_vformat(char *out, size_t cap, const char *fmt, va_list ap)
++{
++    if (!has_pV(fmt))
++        return vsnprintf(out, cap, fmt, ap);
++    size_t pos = 0;
++    if (cap)
++        out[0] = '\0';
++    for (const char *p = fmt; *p; ) {
++        if (*p != '%') {
++            pos = fmt_put(out, cap, pos, p, 1);
++            p++;
++            continue;
++        }
++        if (p[1] == '%') {
++            pos = fmt_put(out, cap, pos, "%", 1);
++            p += 2;
++            continue;
++        }
++        /* rebuild the conversion with '*' resolved: %[flags][width][.prec][length]conv */
++        char spec[48];
++        size_t sl = 0;
++        spec[sl++] = *p++;
++        while (*p && in_set(*p, "-+ #0'") && sl < 40)
++            spec[sl++] = *p++;
++        if (*p == '*') {
++            sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", va_arg(ap, int));
++            p++;
++        } else
++            while (*p >= '0' && *p <= '9' && sl < 40)
++                spec[sl++] = *p++;
++        if (*p == '.') {
++            spec[sl++] = *p++;
++            if (*p == '*') {
++                sl += (size_t)snprintf(spec + sl, sizeof(spec) - sl, "%d", va_arg(ap, int));
++                p++;
++            } else
++                while (*p >= '0' && *p <= '9' && sl < 40)
++                    spec[sl++] = *p++;
++        }
++        int lng = 0;    /* 0 int, 1 long, 2 long long */
++        while (*p && in_set(*p, "hljztqL") && sl < 44) {
++            if (*p == 'l' || *p == 'j' || *p == 'z' || *p == 't')
++                lng = lng ? 2 : 1;
++            if (*p == 'q' || *p == 'L')
++                lng = 2;
++            spec[sl++] = *p++;
++        }
++        char conv = *p;
++        if (conv == '\0')
++            break;
++        p++;
++        spec[sl++] = conv;
++        spec[sl] = '\0';
++        switch (conv) {
++        case 'p':
++            if (*p == 'V') {
++                p++;
++                struct nmx_va_format *vaf = va_arg(ap, struct nmx_va_format *);
++                if (vaf && vaf->fmt && vaf->va) {
++                    char nested[512];
++                    va_list c;
++                    va_copy(c, *vaf->va);
++                    int n = nmx_vformat(nested, sizeof(nested), vaf->fmt, c);
++                    va_end(c);
++                    if (n > 0)
++                        pos = fmt_put(out, cap, pos, nested, (size_t)n < sizeof(nested) ? (size_t)n : sizeof(nested) - 1);
++                }
++            } else
++                pos = fmt_one(out, cap, pos, spec, va_arg(ap, void *));
++            break;
++        case 's':
++            pos = fmt_one(out, cap, pos, spec, va_arg(ap, const char *));
++            break;
++        case 'c':
++            pos = fmt_one(out, cap, pos, spec, va_arg(ap, int));
++            break;
++        case 'd': case 'i':
++            if (lng == 2) pos = fmt_one(out, cap, pos, spec, va_arg(ap, long long));
++            else if (lng == 1) pos = fmt_one(out, cap, pos, spec, va_arg(ap, long));
++            else pos = fmt_one(out, cap, pos, spec, va_arg(ap, int));
++            break;
++        case 'u': case 'o': case 'x': case 'X':
++            if (lng == 2) pos = fmt_one(out, cap, pos, spec, va_arg(ap, unsigned long long));
++            else if (lng == 1) pos = fmt_one(out, cap, pos, spec, va_arg(ap, unsigned long));
++            else pos = fmt_one(out, cap, pos, spec, va_arg(ap, unsigned int));
++            break;
++        case 'b': {     /* FreeBSD/xnu %b: a value and a bit-name string */
++            int v = va_arg(ap, int);
++            const char *bits = va_arg(ap, const char *);
++            pos = fmt_one(out, cap, pos, spec, v, bits);
++            break;
++        }
++        default:        /* unknown: show it as written */
++            pos = fmt_put(out, cap, pos, spec, sl);
++            break;
++        }
++    }
++    return (int)pos;
++}
++
+ static void flight_vemit(bool viaIOLog, const char *fmt, va_list ap)
+ {
+     char buf[640];
+-    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
++    int n = nmx_vformat(buf, sizeof(buf), fmt, ap);
+     if (n < 0)
+         return;
+     if (viaIOLog)
+diff --git a/gpu-port/xkpi/xnu/nmx_pci.cpp b/gpu-port/xkpi/xnu/nmx_pci.cpp
+--- a/gpu-port/xkpi/xnu/nmx_pci.cpp
++++ b/gpu-port/xkpi/xnu/nmx_pci.cpp
+@@ -16,6 +16,8 @@
+ 
+ extern "C" int nmx_trace_get_level(void);                         /* bsdcompat/src/nmx_trace.c */
+ extern "C" void nmx_xnu_nvram_note(const char *key, const char *text);  /* xnu/nmx_kext.cpp */
++/* set by xe (override/xe/nmx_xe_debug.c) once it is probed: formats its interrupt registers for the heartbeat */
++extern "C" { int (*nmx_irq_state_hook)(char *buf, unsigned len) = nullptr; }
+ 
+ extern "C" uint32_t nmx_xnu_pci_read(void *pci, int reg, int width)
+ {
+@@ -186,13 +188,14 @@
+     void (*handler)(void *);
+     void *arg;
+     volatile SInt32 delivered;
++    volatile SInt32 done;      /* handler returns: fewer than delivered while one runs (or hangs) */
+     /* nmxtrace: interrupts per second, a heartbeat in NVRAM, and a guard against an interrupt storm */
+     uint64_t winStart;
+     uint32_t winCount, lastRate;
+     bool stormed;
+     thread_call_t hb;
+     uint32_t hbTicks;
+-    bool initIrq() { delivered = 0; winStart = 0; winCount = lastRate = 0; stormed = false; hb = nullptr; hbTicks = 0; return init(); }
++    bool initIrq() { delivered = 0; done = 0; winStart = 0; winCount = lastRate = 0; stormed = false; hb = nullptr; hbTicks = 0; return init(); }
+ };
+ OSDefineMetaClassAndStructors(NMXIrq, OSObject)
+ 
+@@ -207,9 +210,14 @@
+     NMXIrq *irq = (NMXIrq *)p0;
+     char note[96];
+     irq->hbTicks++;
+-    snprintf(note, sizeof(note), "t=%u irqs=%d rate=%u%s", irq->hbTicks * 2, irq->delivered, irq->lastRate,
+-             irq->stormed ? " storm-guard-tripped" : "");
++    snprintf(note, sizeof(note), "t=%u irqs=%d done=%d rate=%u%s", irq->hbTicks * 2, irq->delivered, irq->done,
++             irq->lastRate, irq->stormed ? " storm-guard-tripped" : "");
+     IOLog("NullMoth GPU: heartbeat %s\n", note);
++    if (nmx_irq_state_hook) {
++        char regs[256];
++        if (nmx_irq_state_hook(regs, sizeof(regs)) > 0)
++            IOLog("NullMoth GPU: irq registers %s\n", regs);
++    }
+     nmx_xnu_nvram_note("nullmoth-gpu-hb", note);
+     if (irq->hbTicks < 30) {
+         uint64_t d;
+@@ -252,6 +260,7 @@
+             }
+         }
+         irq->handler(irq->arg);
++        OSIncrementAtomic(&irq->done);
+     }
+ }
+ 
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_debug.c b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+--- a/gpu-port/xkpi/override/xe/nmx_xe_debug.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_debug.c
+@@ -18,6 +18,8 @@
+ #include "xe_hw_engine_types.h"
+ #include "xe_hw_fence_types.h"
+ #include "xe_lrc.h"
++#include "xe_mmio.h"
++#include "regs/xe_reg_defs.h"
+ #include "nmx_xnu.h"
+ 
+ void nmx_xe_debug_register(struct xe_device *xe);
+@@ -130,8 +132,33 @@
+ 	}
+ }
+ 
++/*
++ * For the nmxtrace heartbeat (xnu/nmx_pci.cpp): the interrupt registers, read without side effects, so a start whose
++ * GPU interrupts stop shows whether the master unit is left disabled or a source is pending/masked. Display: pipe A
++ * (ISR/IMR/IIR/IER at 0x44400), hot-plug (0x44470), GU misc IIR (0x444f8), display interrupt control (0x44200).
++ */
++extern int (*nmx_irq_state_hook)(char *buf, unsigned len);
++
++static int nmx_xe_irq_state(char *buf, unsigned len)
++{
++	struct xe_device *xe = nmx_xe;
++	struct xe_mmio *m;
++
++	if (xe == NULL)
++		return 0;
++	m = xe_root_tile_mmio(xe);
++#define R(off) xe_mmio_read32(m, XE_REG(off))
++	return snprintf(buf, len, "tile 0x%08x gfx 0x%08x on %d | pipeA isr 0x%x imr 0x%x iir 0x%x ier 0x%x | "
++			"hpd isr 0x%x imr 0x%x iir 0x%x ier 0x%x | gu_misc iir 0x%x | disp_ctl 0x%08x",
++			R(0x190008), R(0x190010), atomic_read(&xe->irq.enabled),
++			R(0x44400), R(0x44404), R(0x44408), R(0x4440c),
++			R(0x44470), R(0x44474), R(0x44478), R(0x4447c), R(0x444f8), R(0x44200));
++#undef R
++}
++
+ void nmx_xe_debug_register(struct xe_device *xe)
+ {
+ 	nmx_xe = xe;
++	nmx_irq_state_hook = nmx_xe_irq_state;
+ 	nmx_xnu_set_dump_hook(nmx_xe_dump);
+ }
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -349,3 +349,8 @@
+ trace_calls("xe_ggtt.c", "static int __xe_ggtt_insert_bo_at(struct xe_ggtt *ggtt, struct xe_bo *bo,\n\t\t\t\t  u64 start, u64 end)\n{\n")
+ trace_calls("xe_ggtt.c", "static void xe_ggtt_invalidate(struct xe_ggtt *ggtt)\n{\n")
+ trace_calls("xe_gt_tlb_invalidation.c", "int xe_gt_tlb_invalidation_ggtt(struct xe_gt *gt)\n{\n")
++
++# GPU interrupt delivery (Wildcat Lake: after the first panel modeset no GPU interrupt arrived again - the flip_done of
++# the next commit timed out and the start died): every step of xe's top-level handler, so the flight recorder shows the
++# last step of the last interrupt (the display part is traced in drm-kmod, 0076). Nothing inside spin-locked regions.
++trace_calls("xe_irq.c", "static irqreturn_t dg1_irq_handler(int irq, void *arg)\n{\n")

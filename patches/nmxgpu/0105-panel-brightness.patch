@@ -1,0 +1,258 @@
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 19:49:17
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_port.h	2026-11-16 19:52:28
+@@ -40,6 +40,11 @@
+  */
+ struct nmx_gpu_client { int pid; unsigned int objects; uint64_t bytes; uint64_t shared_bytes; };
+ int nmx_gpu_clients(void *dev, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size);
++/*
++ * MeowXE3: the built-in panel's backlight (eDP), in percent of its range. set < 0 only reads. Returns 0, or ENODEV when
++ * the device has no panel with a backlight the display driver controls.
++ */
++int nmx_fb_backlight(void *dev, int set, int *cur);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 19:49:17
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_port.h	2026-11-16 19:52:28
+@@ -40,6 +40,11 @@
+  */
+ struct nmx_gpu_client { int pid; unsigned int objects; uint64_t bytes; uint64_t shared_bytes; };
+ int nmx_gpu_clients(void *dev, struct nmx_gpu_client *out, int max, uint64_t *tt_used, uint64_t *tt_size);
++/*
++ * MeowXE3: the built-in panel's backlight (eDP), in percent of its range. set < 0 only reads. Returns 0, or ENODEV when
++ * the device has no panel with a backlight the display driver controls.
++ */
++int nmx_fb_backlight(void *dev, int set, int *cur);
+ #ifdef __cplusplus
+ }
+ #endif
+diff -ruN a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 19:49:17
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c	2026-11-16 19:52:28
+@@ -575,6 +575,17 @@
+     return n;
+ }
+ 
++/* set by xe's module init (override/xe/nmx_xe_module.c), like nmx_xe_tt_usage_hook */
++int (*nmx_xe_backlight_hook)(struct drm_device *dev, int set, int *cur);
++
++int nmx_fb_backlight(void *devp, int set, int *cur)
++{
++    struct nmx_fb *fb = fb_of(devp);
++    if (fb == NULL || fb->client.dev == NULL || nmx_xe_backlight_hook == NULL)
++        return ENODEV;
++    return nmx_xe_backlight_hook(fb->client.dev, set, cur);
++}
++
+ /* display sleep and wake from macOS (IOFramebuffer power) */
+ int nmx_fb_power(void *dev, int on)
+ {
+diff -ruN a/gpu-port/xkpi/override/xe/nmx_xe_module.c b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 19:49:17
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c	2026-11-16 19:52:28
+@@ -22,12 +22,51 @@
+ #include "xe_bo.h"
+ #include <drm/ttm/ttm_device.h>
+ #include <drm/ttm/ttm_resource.h>
++#include <drm/drm_connector.h>
++#include <drm/drm_modeset_lock.h>
++#include "intel_backlight.h"
++#include "intel_display_types.h"
+ 
+ /*
+  * MeowXE3: the system-memory heap xe gives userspace (TTM's TT manager: what ANV reports as its heap and measures its
+  * budget against) - bytes in use and its size. 0 for a device another driver owns.
+  */
+ extern uint64_t (*nmx_xe_tt_usage_hook)(struct drm_device *dev, uint64_t *size);   /* override/src/nmx_fb_bridge.c */
++extern int (*nmx_xe_backlight_hook)(struct drm_device *dev, int set, int *cur);     /* override/src/nmx_fb_bridge.c */
++
++/*
++ * MeowXE3: the eDP panel's backlight for macOS's brightness keys and slider (NMXIntelGPUFB's backlight handler). The
++ * level goes through intel_backlight_set_acpi, the display driver's entry for firmware (ACPI) brightness requests: a
++ * 0..100 level scaled into the panel's PWM range, above its minimum, applied while the backlight is on.
++ */
++static int nmx_xe_backlight(struct drm_device *dev, int set, int *cur)
++{
++    struct drm_connector_list_iter it;
++    struct drm_connector *c;
++    int err = ENODEV;
++    if (dev == NULL || dev->driver == NULL || dev->driver->name == NULL || strcmp(dev->driver->name, "xe") != 0)
++        return ENODEV;
++    drm_modeset_lock(&dev->mode_config.connection_mutex, NULL);
++    drm_connector_list_iter_begin(dev, &it);
++    drm_for_each_connector_iter(c, &it) {
++        if (c->connector_type != DRM_MODE_CONNECTOR_eDP)
++            continue;
++        struct intel_panel *p = &to_intel_connector(c)->panel;
++        if (!p->backlight.present || p->backlight.max == 0)
++            continue;
++        if (set >= 0 && c->state != NULL)
++            intel_backlight_set_acpi(c->state, (u32)(set > 100 ? 100 : set), 100);
++        if (cur != NULL) {
++            u32 lo = p->backlight.min, hi = p->backlight.max, lv = p->backlight.level;
++            *cur = hi > lo && lv >= lo ? (int)((u64)(lv - lo) * 100 / (hi - lo)) : 100;
++        }
++        err = 0;
++        break;
++    }
++    drm_connector_list_iter_end(&it);
++    drm_modeset_unlock(&dev->mode_config.connection_mutex);
++    return err;
++}
+ static uint64_t nmx_xe_tt_usage(struct drm_device *dev, uint64_t *size)
+ {
+     *size = 0;
+@@ -94,6 +133,7 @@
+ static int nmx_xe_init(void)
+ {
+     nmx_xe_tt_usage_hook = nmx_xe_tt_usage;
++    nmx_xe_backlight_hook = nmx_xe_backlight;
+ 	for (nmx_xe_done = 0; nmx_xe_done < (int)ARRAY_SIZE(nmx_xe_steps); nmx_xe_done++) {
+ 		int err = nmx_xe_steps[nmx_xe_done].init();
+ 		if (err) {
+diff -ruN a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 19:49:17
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp	2026-11-16 19:52:28
+@@ -11,6 +11,7 @@
+ #include <IOKit/IORegistryEntry.h>
+ #include <pexpert/pexpert.h>
+ #include <IOKit/graphics/IOFramebuffer.h>
++#include <IOKit/graphics/IODisplay.h>
+ #include <IOKit/IODeviceMemory.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/pci/IOPCIDevice.h>
+@@ -153,6 +154,74 @@
+       0, 0 },
+ };
+ 
++/*
++ * MeowXE3: laptop panel brightness (after NullMoth's NVRMBacklightHandler, NVRMFB). macOS gives the brightness keys and
++ * slider to its built-in display, an AppleBacklightDisplay, which IOGraphics creates for a connection that reports
++ * kIOConnectionBuiltIn and an LCD from getAppleSense(), provided a service named "backlight" existed when the first
++ * framebuffer was opened (IOFramebuffer::open). This handler is that service, published below the framebuffer before
++ * IOFramebuffer::start; IODisplay finds it (searchParameterHandlers) and offers "brightness" and "linear-brightness",
++ * both percent of the panel's range. Levels are applied from a thread call: IODisplay calls doIntegerSet() with the
++ * framebuffer lock held, and the display driver takes its modeset lock.
++ */
++static const SInt32 kNmxMinBacklight = 5;      /* never 0: some panels switch the backlight off completely */
++
++class NMXBacklightHandler : public IODisplayParameterHandler {
++    OSDeclareDefaultStructors(NMXBacklightHandler)
++    void *fDev = nullptr;
++    thread_call_t fApply = nullptr;
++    volatile SInt32 fPending = -1;
++    SInt32 fLevel = 100;
++    static void applyFire(thread_call_param_t p, thread_call_param_t) {
++        NMXBacklightHandler *me = (NMXBacklightHandler *)p;
++        SInt32 v;
++        do { v = me->fPending; } while (!OSCompareAndSwap((UInt32)v, (UInt32)-1, (volatile UInt32 *)&me->fPending));
++        if (v < 0) return;
++        int err = nmx_fb_backlight(me->fDev, v < kNmxMinBacklight ? kNmxMinBacklight : v, nullptr);
++        if (err == 0) me->fLevel = v;
++        else IOLog("MeowXE3: backlight: setting %d%% failed (%d)\n", (int)v, err);
++    }
++public:
++    static NMXBacklightHandler *withDev(void *dev, int level) {
++        NMXBacklightHandler *h = OSTypeAlloc(NMXBacklightHandler);
++        if (!h || !h->init()) { OSSafeReleaseNULL(h); return nullptr; }
++        h->fDev = dev;
++        h->fLevel = level >= 0 && level <= 100 ? level : 100;
++        h->fApply = thread_call_allocate(applyFire, h);
++        if (!h->fApply) { h->release(); return nullptr; }
++        return h;
++    }
++    void free() override {
++        if (fApply) { thread_call_cancel(fApply); while (!thread_call_free(fApply)) { thread_call_cancel(fApply); IOSleep(1); } fApply = nullptr; }
++        IODisplayParameterHandler::free();
++    }
++    /* the display may have no IODisplayParameters yet; IODisplay::setProperties only accepts parameters listed there */
++    bool setDisplay(IODisplay *display) override {
++        if (!display) return false;
++        OSObject *old = display->copyProperty(gIODisplayParametersKey);
++        OSDictionary *cur = OSDynamicCast(OSDictionary, old);
++        OSDictionary *params = cur ? OSDictionary::withDictionary(cur) : OSDictionary::withCapacity(2);
++        OSSafeReleaseNULL(old);
++        if (!params) return false;
++        IODisplay::addParameter(params, gIODisplayBrightnessKey, 0, 100);
++        IODisplay::setParameter(params, gIODisplayBrightnessKey, fLevel);
++        IODisplay::addParameter(params, gIODisplayLinearBrightnessKey, 0, 100);
++        IODisplay::setParameter(params, gIODisplayLinearBrightnessKey, fLevel);
++        display->setProperty(gIODisplayParametersKey, params);
++        params->release();
++        IOLog("MeowXE3: backlight: brightness parameters on %s, panel at %d%%\n", display->getName(), (int)fLevel);
++        return true;
++    }
++    bool doIntegerSet(OSDictionary *, const OSSymbol *paramName, UInt32 value) override {
++        if (paramName != gIODisplayBrightnessKey && paramName != gIODisplayLinearBrightnessKey) return false;
++        fPending = value > 100 ? 100 : (SInt32)value;
++        thread_call_enter(fApply);
++        return true;
++    }
++    bool doDataSet(const OSSymbol *, OSData *) override { return false; }
++    bool doUpdate() override { return true; }
++};
++OSDefineMetaClassAndStructors(NMXBacklightHandler, IODisplayParameterHandler)
++
+ class NMXGPUFB : public IOFramebuffer {
+     OSDeclareDefaultStructors(NMXGPUFB)
+     void *fDev = nullptr;
+@@ -164,6 +233,7 @@
+     thread_call_t fVblTimer = nullptr;
+     uint64_t fVblNext = 0;
+     thread_call_t fMemTimer = nullptr;      /* MeowXE3: per-app GPU memory report, every 5 s (memFire) */
++    NMXBacklightHandler *fBacklight = nullptr;  /* MeowXE3: the panel's brightness control (NMXBacklightHandler) */
+     volatile bool fStopping = false;
+     int fFlags = 0;
+     IOService *fAccel = nullptr;            /* 0x200: the accelerator that armed this head (retained) */
+@@ -288,6 +358,21 @@
+             setProperty("IOFBDependentID", pci->getRegistryEntryID(), 64);
+             setProperty("IOFBDependentIndex", 0ULL, 32);
+         }
++        /* MeowXE3: before IOFramebuffer::start - IOFramebuffer::open looks for a "backlight" service */
++        {
++            int level = -1;
++            if (nmx_fb_backlight(fDev, -1, &level) == 0 && (fBacklight = NMXBacklightHandler::withDev(fDev, level)) != nullptr) {
++                fBacklight->setName("backlight");
++                if (fBacklight->attach(this)) {
++                    fBacklight->registerService(kIOServiceSynchronous);
++                    FBLOG("panel backlight at %d%%: brightness keys and slider through AppleBacklightDisplay", level);
++                } else {
++                    OSSafeReleaseNULL(fBacklight);
++                }
++            } else {
++                FBLOG("no panel backlight the display driver controls: no brightness control");
++            }
++        }
+         nmx_trace("publish: start: IOFramebuffer::start", 0);
+         if (!IOFramebuffer::start(provider)) return false;
+         nmx_trace("publish: start: vblank timer (flags)", fFlags);
+@@ -313,8 +398,19 @@
+         return true;
+     }
+ 
++    /* MeowXE3: AppleBacklightDisplay::probe takes only an LCD connection; without a backlight the identity is the EDID's */
++    IOReturn getAppleSense(IOIndex connectIndex, UInt32 *senseType, UInt32 *primary, UInt32 *extended, UInt32 *displayType) override {
++        if (connectIndex != 0 || !fBacklight) return kIOReturnUnsupported;
++        if (senseType) *senseType = 0;
++        if (primary) *primary = 0;
++        if (extended) *extended = 0;
++        if (displayType) *displayType = 20;   /* kGenericLCD (IOKit/ndrvsupport/IOMacOSVideo.h) */
++        return kIOReturnSuccess;
++    }
++
+     void stop(IOService *provider) override {
+         fStopping = true;
++        if (fBacklight) { fBacklight->detach(this); OSSafeReleaseNULL(fBacklight); }
+         /* thread_call_cancel_wait is not exported to kexts: cancel and retry the free until the callback is out */
+         if (fVblTimer) {
+             thread_call_cancel(fVblTimer);
+@@ -531,6 +627,7 @@
+         if (idx != 0 || !value) return kIOReturnBadArgument;
+         switch (attr) {
+         case kConnectionEnable: case kConnectionCheckEnable: *value = 1; return kIOReturnSuccess;
++        case kConnectionFlags: *value = fBacklight ? kIOConnectionBuiltIn : 0; return kIOReturnSuccess;   /* MeowXE3 */
+         case kConnectionColorModesSupported: case kConnectionColorMode: *value = 0x00000001; return kIOReturnSuccess;
+         case kConnectionColorDepthsSupported: case kConnectionControllerColorDepth: case kConnectionControllerDepthsSupported:
+             *value = 0x00000002; return kIOReturnSuccess;

@@ -1,0 +1,86 @@
+Subject: [PATCH 0058] nmxtrace=3: keep the last checkpoint in NVRAM for a hang that blanks the screen
+
+Wildcat Lake test start 5 (with 0057) got past the BAR0 fault: xe found "pantherlake/wildcatlake (device ID fd80)
+integrated display version 30.02", "WCL bring-up: PSR 0, FBC 0, DC 0", passed xe_gt_init_hwconfig's force wake and
+"successfully loaded firmware image 'xe/ptl_guc_70.bin'". Then the panel stayed lit but went black (the boot
+framebuffer no longer scanned out), the console with it, and the start never came back; nothing reached the log.
+
+- bsdcompat/src/nmx_trace.c: nmxtrace=3 prints each checkpoint and also stores "<step> <value>" in NVRAM.
+- xnu/nmx_kext.cpp: nmx_xnu_trace_breadcrumb() sets nullmoth-gpu-trace and syncs NVRAM (as the boot guard does).
+Read it at the next start with:  nvram nullmoth-gpu-trace
+
+Applies on top of 0051-0057.
+
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_trace.c
+@@ -3,6 +3,8 @@
+  * the attach before xe printed a line, and nothing reached the log). Off unless asked for at boot:
+  *   nmxtrace=1         prints "NMXT <step>" on the console before each step of the attach and of xe's probe
+  *   nmxtrace=2         the same, then waits 200 ms so the line is on screen before a step that hangs
++ *   nmxtrace=3         prints each step and keeps the last one in NVRAM (nullmoth-gpu-trace, synced), for a hang
++ *                      that blanks the screen: read it at the next start with  nvram nullmoth-gpu-trace
+  *   nmxdrmdebug=<mask> sets drm.debug (DRM_UT_* bits; 0x106 = driver, KMS, DP) for this start
+  * The steps are marked in xnu/nmx_kext.cpp, bsdcompat/src/nmx_port.c and (by fork_xe.py) xe's probe functions.
+  */
+@@ -13,6 +15,7 @@
+ 
+ void nmx_trace_init(void);
+ void nmx_trace(const char *what, long val);
++void nmx_xnu_trace_breadcrumb(const char *step);	/* xnu/nmx_kext.cpp */
+ 
+ static int nmx_trace_level = -1;
+ 
+@@ -41,6 +44,12 @@
+     if (nmx_trace_level <= 0)
+         return;
+     printf("NMXT %s %ld\n", what, val);
+-    if (nmx_trace_level >= 2)
++    if (nmx_trace_level == 2)
+         IOSleep(200);
++    if (nmx_trace_level >= 3) {
++        char crumb[128];
++
++        snprintf(crumb, sizeof(crumb), "%s %ld", what, val);
++        nmx_xnu_trace_breadcrumb(crumb);
++    }
+ }
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -212,7 +212,35 @@
+             n->removeProperty(k);
+         }
+         k->release();
++    }
++    n->sync();
++    n->release();
++}
++
++/*
++ * nmxtrace=3 (bsdcompat/src/nmx_trace.c): each checkpoint is also kept in NVRAM as nullmoth-gpu-trace and synced, so
++ * a start that hangs with a black screen and no saved log still tells, at the next start, the last step it reached
++ * (Wildcat Lake test 5: the panel went black during xe_gt_init_hwconfig and nothing was logged).
++ */
++extern "C" void nmx_xnu_trace_breadcrumb(const char *step)
++{
++    IODTNVRAM *n = nmx_nvram();
++    if (n == nullptr || step == nullptr) {
++        if (n)
++            n->release();
++        return;
+     }
++    size_t len = strlen(step);
++    if (len > 120)
++        len = 120;
++    const OSSymbol *k = OSSymbol::withCString("nullmoth-gpu-trace");
++    OSData *d = OSData::withBytes(step, (unsigned)len);
++    if (k != nullptr && d != nullptr)
++        n->setProperty(k, d);
++    if (d)
++        d->release();
++    if (k)
++        k->release();
+     n->sync();
+     n->release();
+ }

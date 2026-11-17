@@ -1,0 +1,65 @@
+Subject: [PATCH 0094] nullmoth-accel-delay: announce the GPU claim (NMXAccel's start) seconds after the attach
+
+Wildcat Lake: the first start with NullMoth 2.0.2's NMXAccel stopped the whole Mac about 1 s after the framebuffer
+was published, with nothing saved (the system log is lost on a forced restart). NVRAM nullmoth-accel-delay <s>
+(1-600) sets nmxgpu-claimed and re-registers the PCI device that long after the attach, on a thread call, so
+NMXAccel starts with the desktop up and its messages being recorded. Unset or 0: at once, as before.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index f5debf3..bd01cbe 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -66,6 +66,8 @@ class NMXGPU : public IOService {
+     void holdDisplay();
+     void releaseDisplay(const char *why);
+     static void holdCapFire(thread_call_param_t p0, thread_call_param_t);
++    thread_call_t claimCall_ = nullptr;
++    static void claimFire(thread_call_param_t p0, thread_call_param_t);
+ public:
+     /* holding_: 0 none, 1 held, 2 paused (around the boot framebuffer's synchronous retirement, xnu/nmx_fb.cpp) */
+     void pauseDisplayHold();
+@@ -463,8 +465,23 @@ void NMXGPU::attachNow()
+     registerService();
+     /* NMXAccel (the Metal accelerator for this GPU) starts only on a device this driver has claimed; it declined while
+        the claim was pending, so matching on the device runs again now that it is set */
+-    pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
+-    pci_->registerService();
++    /*
++     * nullmoth-accel-delay <seconds> (bring-up): announce the claim that long after the publish instead of now, so
++     * NMXAccel starts with the desktop up and its log being recorded (the first start with NMXAccel stopped the Mac
++     * ~1 s after the publish, with nothing saved). 0 or unset: now, as before.
++     */
++    int accelDelay = nmx_xnu_nvram_int("nullmoth-accel-delay");
++    if (accelDelay > 0 && accelDelay <= 600 && (claimCall_ = thread_call_allocate(&NMXGPU::claimFire, this)) != nullptr) {
++        retain();   /* for the delayed claim */
++        uint64_t d;
++        clock_interval_to_deadline((uint32_t)accelDelay, kSecondScale, &d);
++        thread_call_enter_delayed(claimCall_, d);
++        IOLog("NullMoth GPU: the claim (NMXAccel) is announced in %d s (nullmoth-accel-delay)\n", accelDelay);
++        nmx_trace("attach: claim delayed (s)", accelDelay);
++    } else {
++        pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
++        pci_->registerService();
++    }
+     /* light the outputs and hand them to macOS; without it the device still renders, with no screen of its own */
+     watchBootFramebuffer();
+     nmx_trace("attach: publishing the framebuffer", 0);
+@@ -540,6 +557,18 @@ void NMXGPU::releaseDisplay(const char *why)
+     }
+ }
+ 
++void NMXGPU::claimFire(thread_call_param_t p0, thread_call_param_t)
++{
++    NMXGPU *self = (NMXGPU *)p0;
++    if (self->attach_ >= 0 && self->pci_ != nullptr && !self->isInactive()) {
++        IOLog("NullMoth GPU: announcing the claim now (NMXAccel may start)\n");
++        nmx_trace("attach: claim announced (delayed)", 0);
++        self->pci_->setProperty("nmxgpu-claimed", kOSBooleanTrue);
++        self->pci_->registerService();
++    }
++    self->release();
++}
++
+ void NMXGPU::holdCapFire(thread_call_param_t p0, thread_call_param_t)
+ {
+     NMXGPU *self = (NMXGPU *)p0;

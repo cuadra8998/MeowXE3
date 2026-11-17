@@ -1,0 +1,53 @@
+Subject: [PATCH 0091] nullmoth-fbflags 0x100 turns the boot framebuffer watchers off; flight log "alive" line
+
+Wildcat Lake test 37: shutdown still stalled, before systemWillShutdown (no shutdown breadcrumb); the last log lines
+are IOGraphics' mode change of the boot framebuffer (will-change event, no did-change), and every test start since
+the watchers (0081) stalled there. Bring-up switch 0x100 skips watchBootFramebuffer; the flight writer logs "alive"
+every 5 s, so a log that goes on after a stall shows a stuck step rather than a stopped Mac.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_kext.cpp b/gpu-port/xkpi/xnu/nmx_kext.cpp
+index 39133f0..f5debf3 100644
+--- a/gpu-port/xkpi/xnu/nmx_kext.cpp
++++ b/gpu-port/xkpi/xnu/nmx_kext.cpp
+@@ -29,6 +29,7 @@
+ extern "C" void nmx_trace(const char *what, long val);
+ extern "C" void nmx_flight_start(void);    /* xnu/nmx_flight.cpp */
+ extern "C" int nmx_trace_get_level(void);  /* bsdcompat/src/nmx_trace.c */
++extern "C" int nmx_xnu_nvram_int(const char *key);   /* below */
+ #if __has_include("nmx_buildstamp.h")
+ #include "nmx_buildstamp.h"      /* written by vm/tools/cycle.sh for each test build */
+ #else
+@@ -153,6 +154,11 @@ void NMXGPU::watchBootFramebuffer()
+ {
+     if (nmx_trace_get_level() <= 0 || pci_ == nullptr)
+         return;
++    /* nullmoth-fbflags 0x100 (bring-up): no watchers; shutdown stalled on every test start that had them (26-37) */
++    if (nmx_xnu_nvram_int("nullmoth-fbflags") & 0x100) {
++        nmx_trace("attach: boot framebuffer watchers off (nullmoth-fbflags 0x100)", 0);
++        return;
++    }
+     pci_->findPCICapability(kIOPCIPowerManagementCapability, &pmCap_);
+     pci_->registerInterestedDriver(this);
+     pci_->registerInterest(gIOGeneralInterest, &NMXGPU::ioMessage, this, nullptr);
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+index 7449fde..2f20032 100644
+--- a/gpu-port/xkpi/xnu/nmx_flight.cpp
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -305,8 +305,17 @@ static void flight_drain_locked(void);
+ 
+ static void flight_writer(void *, wait_result_t)
+ {
++    /* an "alive" line every 5 s: after a stall, tells a stuck step (lines go on) from a stopped Mac (they end) */
++    uint64_t next_alive = 0;
+     for (;;) {
+         IOSleep(40);
++        uint64_t now_ns;
++        absolutetime_to_nanoseconds(mach_absolute_time(), &now_ns);
++        if (now_ns >= next_alive) {
++            if (next_alive != 0)
++                nmx_flight_iolog("NullMoth flight recorder: alive\n");
++            next_alive = now_ns + 5000000000ULL;
++        }
+         IOLockLock(gFileLock);
+         flight_drain_locked();
+         IOLockUnlock(gFileLock);

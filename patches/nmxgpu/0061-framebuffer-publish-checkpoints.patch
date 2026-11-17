@@ -1,0 +1,133 @@
+Subject: [PATCH 0061] Checkpoints in NMXGPU's framebuffer publish
+
+Wildcat Lake test start 7 (nmxtrace=3) left "attach: publishing the framebuffer 0" in NVRAM: xe's whole probe
+finished (GuC, DMC v2.31, power wells, CDCLK, eDP, initial plane) and the start stopped inside nmx_fb_publish.
+The panel had gone black earlier, during xe_display_init_noaccel, while the probe carried on (expected: xe drops the
+firmware's picture; NMXGPU's own framebuffer is meant to replace it).
+
+- override/src/nmx_fb_bridge.c: nmx_trace before/after each step of nmx_fb_open (DRM client, output probe, scan-out
+  buffer in stolen memory, vmap, contiguity check, clear, modeset commit, client register), with the result.
+- xnu/nmx_fb.cpp: nmx_trace around nmx_fb_open, the IOFramebuffer init/attach/start, registerService and the boot
+  framebuffer's retirement.
+
+Applies on top of 0051-0059.
+
+diff --git a/gpu-port/xkpi/override/src/nmx_fb_bridge.c b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+--- a/gpu-port/xkpi/override/src/nmx_fb_bridge.c
++++ b/gpu-port/xkpi/override/src/nmx_fb_bridge.c
+@@ -132,6 +132,8 @@
+     kfree(fb);
+ }
+ 
++void nmx_trace(const char *what, long val);	/* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++
+ int nmx_fb_open(void *devp, struct nmx_fb_info *out)
+ {
+     device_t dev = devp;
+@@ -151,13 +153,16 @@
+     struct nmx_fb *fb = kzalloc(sizeof(*fb), GFP_KERNEL);
+     if (fb == NULL)
+         return ENOMEM;
++    nmx_trace("fb: drm_client_init", 0);
+     err = -drm_client_init(drm, &fb->client, "nmxfb", &bridge_funcs);
+     if (err) {
+         printf("NullMoth display: DRM client refused (%d)\n", err);
+         kfree(fb);
+         return err;
+     }
++    nmx_trace("fb: drm_client_modeset_probe", 0);
+     err = -drm_client_modeset_probe(&fb->client, 0, 0);
++    nmx_trace("fb: modeset probe (err)", err);
+     if (err) {
+         printf("NullMoth display: probing the outputs failed (%d)\n", err);
+         goto fail;
+@@ -186,6 +191,7 @@
+         goto fail;
+     }
+ 
++    nmx_trace("fb: scan-out buffer (width)", out->width);
+     nmx_fb_want_stolen = 1;
+     fb->buffer = drm_client_framebuffer_create(&fb->client, out->width, out->height, DRM_FORMAT_XRGB8888);
+     nmx_fb_want_stolen = 0;
+@@ -197,7 +203,9 @@
+     }
+     out->pitch = fb->buffer->fb->pitches[0];
+ 
++    nmx_trace("fb: drm_client_buffer_vmap", 0);
+     err = -drm_client_buffer_vmap(fb->buffer, &fb->map);
++    nmx_trace("fb: vmap (err)", err);
+     if (err) {
+         printf("NullMoth display: the scan-out buffer would not map (%d)\n", err);
+         goto fail;
+@@ -207,6 +215,7 @@
+     /* the published range must be one physical run: check every page of the CPU view */
+     const char *va = fb->map.is_iomem ? (const char *)fb->map.vaddr_iomem : (const char *)fb->map.vaddr;
+     uint64_t size = (uint64_t)out->pitch * out->height;
++    nmx_trace("fb: contiguity check (iomem)", fb->map.is_iomem);
+     uint64_t base = nmx_xnu_kva_to_phys(va);
+     for (uint64_t off = PAGE_SIZE; off < size; off += PAGE_SIZE)
+         if (nmx_xnu_kva_to_phys(va + off) != base + off) {
+@@ -222,6 +231,7 @@
+     out->phys = base;
+     out->size = round_page(size);
+     out->kva = (uint64_t)(uintptr_t)va;
++    nmx_trace("fb: clearing the buffer (phys)", (long)base);
+     memset(__DECONST(char *, va), 0, size);       /* black until WindowServer draws */
+ 
+     mutex_lock(&fb->client.modeset_mutex);
+@@ -229,11 +239,14 @@
+         if (ms->mode != NULL)
+             ms->fb = fb->buffer->fb;
+     mutex_unlock(&fb->client.modeset_mutex);
++    nmx_trace("fb: drm_client_modeset_commit", 0);
+     err = -drm_client_modeset_commit(&fb->client);
++    nmx_trace("fb: modeset commit (err)", err);
+     if (err) {
+         printf("NullMoth display: the mode set failed (%d)\n", err);
+         goto fail;
+     }
++    nmx_trace("fb: drm_client_register", 0);
+     drm_client_register(&fb->client);       /* from here on hotplug reaches bridge_hotplug */
+ 
+     fb->info = *out;
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -253,28 +253,37 @@
+ }
+ 
+ /* lights the device's outputs and publishes them under 'gpu'; nullptr when there is nothing to show (reason logged) */
++extern "C" void nmx_trace(const char *what, long val);    /* bsdcompat/src/nmx_trace.c: off unless nmxtrace is set */
++
+ IOService *nmx_fb_publish(IOService *gpu, void *dev)
+ {
+     nmx_fb_info info;
++    nmx_trace("publish: nmx_fb_open", 0);
+     int err = nmx_fb_open(dev, &info);
++    nmx_trace("publish: nmx_fb_open (err)", err);
+     if (err || !info.ok) {
+         FBLOG("no framebuffer (%d)", err);
+         return nullptr;
+     }
++    nmx_trace("publish: IOFramebuffer init and attach", 0);
+     NMXGPUFB *fb = OSTypeAlloc(NMXGPUFB);
+     if (fb == nullptr || !fb->initWith(dev, info) || !fb->attach(gpu)) {
+         OSSafeReleaseNULL(fb);
+         nmx_fb_close(dev);
+         return nullptr;
+     }
++    nmx_trace("publish: IOFramebuffer start", 0);
+     if (!fb->start(gpu)) {
+         fb->detach(gpu);
+         fb->release();
+         nmx_fb_close(dev);
+         return nullptr;
+     }
++    nmx_trace("publish: registerService", 0);
+     fb->registerService();
++    nmx_trace("publish: retiring the boot framebuffer", 0);
+     retire_boot_framebuffer(gpu, fb);
++    nmx_trace("publish: done", 0);
+     return fb;
+ }
+ 

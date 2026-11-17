@@ -1,0 +1,80 @@
+Subject: [PATCH 0083] framebuffer: opt-in IOFramebuffer power handling (nullmoth-fbflags 0x20), open() traced
+
+Wildcat Lake test 26 (with 0082): no panic, the Mac ran on with NMXGPU's pipe lit, but IOGraphics never opened
+NMXGPU's framebuffer (no enableController/getApertureRange call). IOFramebuffer::setPowerState is what starts the
+IOFBController thread that opens it (checkPowerWork -> startAsync -> open); NMXGPUFB acknowledges power at once
+instead. Bring-up switch, the default unchanged: nullmoth-fbflags 0x20 registers IONDRVFramebuffer's three power
+states and passes setPowerState to IOFramebuffer. open() is traced (publish: cb open).
+
+diff --git a/gpu-port/xkpi/xnu/nmx_fb.cpp b/gpu-port/xkpi/xnu/nmx_fb.cpp
+index ba1ca69..14e7d0b 100644
+--- a/gpu-port/xkpi/xnu/nmx_fb.cpp
++++ b/gpu-port/xkpi/xnu/nmx_fb.cpp
+@@ -26,9 +26,10 @@ extern "C" int nmx_xnu_nvram_int(const char *key);    /* xnu/nmx_kext.cpp */
+  * nullmoth-fbstop=1 kept the Mac alive with the pipe running). NVRAM nullmoth-fbflags, read when the framebuffer
+  * is created: 0x1 = not the console device, 0x2 = no software vblank timer, 0x4 = no power driver for the framebuffer,
+  * 0x8 = keep the firmware's boot framebuffer (as -nmxkeepndrv), 0x10 = retire it before the GPU is offered to the
+- * drivers instead of after the publish (xnu/nmx_kext.cpp).
++ * drivers instead of after the publish (xnu/nmx_kext.cpp), 0x20 = IOFramebuffer's own power handling (below).
+  */
+-enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8, kFbRetireEarly = 0x10 };
++enum { kFbNoConsole = 0x1, kFbNoVblank = 0x2, kFbNoPower = 0x4, kFbKeepBootFb = 0x8, kFbRetireEarly = 0x10,
++       kFbIOGraphicsPower = 0x20 };
+ 
+ 
+ #define FBLOG(fmt, ...) IOLog("NullMoth display: " fmt "\n", ##__VA_ARGS__)
+@@ -37,6 +38,19 @@ static IOPMPowerState kFbPowerStates[2] = {
+     { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+     { kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
+ };
++/*
++ * nullmoth-fbflags 0x20 (bring-up): IOFramebuffer::setPowerState runs instead of the immediate acknowledgement. It is
++ * what starts IOGraphics' controller thread, which opens the framebuffer (IOFBController::checkPowerWork ->
++ * startAsync -> open -> enableController ...): with the immediate acknowledgement the Mac ran on but IOGraphics never
++ * opened NMXGPU's framebuffer (test 26, not one enableController/getApertureRange). IOFramebuffer counts power in
++ * IONDRVFramebuffer's three states (off, doze, on), passed to setAttribute(kIOPowerAttribute).
++ */
++static IOPMPowerState kFbPowerStates3[3] = {
++    { kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
++    { kIOPMPowerStateVersion1, 0, 0, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
++    { kIOPMPowerStateVersion1, kIOPMDeviceUsable | kIOPMMaxPerformance, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0,
++      0, 0 },
++};
+ 
+ class NMXGPUFB : public IOFramebuffer {
+     OSDeclareDefaultStructors(NMXGPUFB)
+@@ -106,7 +120,8 @@ public:
+         }
+         nmx_trace("publish: start: registerPowerDriver (skipped)", fFlags & kFbNoPower);
+         if (!(fFlags & kFbNoPower))
+-            registerPowerDriver(this, kFbPowerStates, 2);
++            registerPowerDriver(this, (fFlags & kFbIOGraphicsPower) ? kFbPowerStates3 : kFbPowerStates,
++                                (fFlags & kFbIOGraphicsPower) ? 3 : 2);
+         nmx_trace("publish: start: done", 0);
+         FBLOG("framebuffer %ux%u at %u.%02u Hz", fInfo.width, fInfo.height, fRefresh16 >> 16,
+               ((fRefresh16 & 0xFFFF) * 100) >> 16);
+@@ -125,6 +140,12 @@ public:
+     }
+ 
+     IOReturn enableController() override { nmx_trace("publish: cb enableController", 0); return kIOReturnSuccess; }
++    IOReturn open() override {
++        nmx_trace("publish: cb open", 0);
++        IOReturn r = IOFramebuffer::open();
++        nmx_trace("publish: cb open done (ret)", (long)r);
++        return r;
++    }
+     bool isConsoleDevice() override { nmx_trace("publish: cb isConsoleDevice", fFlags); return !(fFlags & kFbNoConsole); }
+     IODeviceMemory *getApertureRange(IOPixelAperture aperture) override {
+         nmx_trace("publish: cb getApertureRange", (long)aperture);
+@@ -206,8 +227,10 @@ public:
+     IOReturn setApertureEnable(IOPixelAperture, IOOptionBits e) override { nmx_trace("publish: cb setApertureEnable", (long)e); return kIOReturnSuccess; }
+     IOReturn setStartupDisplayMode(IODisplayModeID, IOIndex) override { return kIOReturnSuccess; }
+     /* power acknowledged at once; left to IOFramebuffer it waits on a shared thread (seen with NVRMFB) */
+-    IOReturn setPowerState(unsigned long ordinal, IOService *) override {
++    IOReturn setPowerState(unsigned long ordinal, IOService *whatDevice) override {
+         nmx_trace("publish: cb setPowerState", (long)ordinal);
++        if (fFlags & kFbIOGraphicsPower)
++            return IOFramebuffer::setPowerState(ordinal, whatDevice);
+         handleEvent(ordinal ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff);
+         return kIOPMAckImplied;
+     }

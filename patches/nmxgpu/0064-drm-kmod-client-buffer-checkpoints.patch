@@ -1,0 +1,90 @@
+Subject: [PATCH 0064] drm-kmod: checkpoints in drm_client buffer creation (applied to drm-kmod, after 0062)
+
+nmx_trace before each call in drm_client_framebuffer_create, drm_client_buffer_create (dumb buffer) and
+drm_client_buffer_addfb. Off unless the boot argument nmxtrace is set.
+
+diff --git a/drivers/gpu/drm/drm_client.c b/drivers/gpu/drm/drm_client.c
+--- a/drivers/gpu/drm/drm_client.c
++++ b/drivers/gpu/drm/drm_client.c
+@@ -3,6 +3,7 @@
+  * Copyright 2018 Noralf Trønnes
+  */
+ 
++void nmx_trace(const char *what, long val);	/* NullMoth: bsdcompat/src/nmx_trace.c */
+ #include <linux/iosys-map.h>
+ #include <linux/list.h>
+ #include <linux/mutex.h>
+@@ -192,6 +193,7 @@
+ 	struct drm_gem_object *obj;
+ 	int ret;
+ 
++	nmx_trace("drm_client_buffer_create: kzalloc", 0);
+ 	buffer = kzalloc(sizeof(*buffer), GFP_KERNEL);
+ 	if (!buffer)
+ 		return ERR_PTR(-ENOMEM);
+@@ -201,10 +203,12 @@
+ 	dumb_args.width = width;
+ 	dumb_args.height = height;
+ 	dumb_args.bpp = drm_format_info_bpp(info, 0);
++	nmx_trace("drm_client_buffer_create: drm_mode_create_dumb", 0);
+ 	ret = drm_mode_create_dumb(dev, &dumb_args, client->file);
+ 	if (ret)
+ 		goto err_delete;
+ 
++	nmx_trace("drm_client_buffer_create: drm_gem_object_lookup", 0);
+ 	obj = drm_gem_object_lookup(client->file, dumb_args.handle);
+ 	if (!obj)  {
+ 		ret = -ENOENT;
+@@ -218,6 +222,7 @@
+ 	return buffer;
+ 
+ err_delete:
++	nmx_trace("drm_client_buffer_create: drm_client_buffer_delete", 0);
+ 	drm_client_buffer_delete(buffer);
+ 
+ 	return ERR_PTR(ret);
+@@ -383,6 +388,7 @@
+ 	fb_req.handles[0] = handle;
+ 	fb_req.pitches[0] = buffer->pitch;
+ 
++	nmx_trace("drm_client_buffer_addfb: drm_mode_addfb2", 0);
+ 	ret = drm_mode_addfb2(client->dev, &fb_req, client->file);
+ 	if (ret)
+ 		return ret;
+@@ -392,8 +398,10 @@
+ 		return -ENOENT;
+ 
+ 	/* drop the reference we picked up in framebuffer lookup */
++	nmx_trace("drm_client_buffer_addfb: drm_framebuffer_put", 0);
+ 	drm_framebuffer_put(buffer->fb);
+ 
++	nmx_trace("drm_client_buffer_addfb: strscpy", 0);
+ 	strscpy(buffer->fb->comm, client->name, TASK_COMM_LEN);
+ 
+ 	return 0;
+@@ -420,11 +428,13 @@
+ 	u32 handle;
+ 	int ret;
+ 
++	nmx_trace("drm_client_framebuffer_create: drm_client_buffer_create", 0);
+ 	buffer = drm_client_buffer_create(client, width, height, format,
+ 					  &handle);
+ 	if (IS_ERR(buffer))
+ 		return buffer;
+ 
++	nmx_trace("drm_client_framebuffer_create: drm_client_buffer_addfb", 0);
+ 	ret = drm_client_buffer_addfb(buffer, width, height, format, handle);
+ 
+ 	/*
+@@ -433,9 +443,11 @@
+ 	 * object as DMA-buf. The framebuffer and our buffer structure are still
+ 	 * holding references to the GEM object to prevent its destruction.
+ 	 */
++	nmx_trace("drm_client_framebuffer_create: drm_mode_destroy_dumb", 0);
+ 	drm_mode_destroy_dumb(client->dev, handle, client->file);
+ 
+ 	if (ret) {
++		nmx_trace("drm_client_framebuffer_create: drm_client_buffer_delete", 0);
+ 		drm_client_buffer_delete(buffer);
+ 		return ERR_PTR(ret);
+ 	}

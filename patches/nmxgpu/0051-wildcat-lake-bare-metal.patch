@@ -1,0 +1,50 @@
+diff --git a/gpu-port/xkpi/fork_xe.py b/gpu-port/xkpi/fork_xe.py
+index 80d5e0e..59c9a58 100644
+--- a/gpu-port/xkpi/fork_xe.py
++++ b/gpu-port/xkpi/fork_xe.py
+@@ -80,8 +80,8 @@ edit("display/xe_display.c", [('#include "intel_acpi.h"\n', '#include "intel_acp
+ # has_sriov set, xe_sriov_probe_early() reads VF_CAP_REG and runs in VF mode on a VF, where update_device_info()
+ # already turns off display, GSC, GuC PC and pcode. On the physical function nothing changes (the PF path needs
+ # sriov_configure, removed above, and stays off: pf readiness fails without VFs to provision).
+-edit("xe_pci.c", [("\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.require_force_probe = true,\n",
+-                   "\tPLATFORM(PANTHERLAKE),\n\t.has_display = true,\n\t.has_sriov = true,\n\t.require_force_probe = true,\n", 1)])
++# (ericek 0001 enabled .has_sriov for the VF guest; on bare metal the GPU is the physical function, and 6.14 xe's
++# PF path is not ready for Panther Lake, so it stays off here.)
+ # LinuxKPI puts a PCI driver on the "vgapci" bus class (where NMXGPU offers display devices, nmx_port_attach) only
+ # when it is named "drmn" - drm-kmod renames i915's and amdgpu's driver for that. xe kept "xe", registered on plain
+ # "pci" and was never offered the GPU: every xe device ended in "vgapci0: no driver attached".
+@@ -209,6 +209,20 @@ edit("xe_guc_ct.c", [("\t\txe_gt_err(gt, \"Timed out wait for G2H, fence %u, act
+     "\t\t\t\t  desc_read(nxe, (&ct->ctbs.g2h), head), desc_read(nxe, (&ct->ctbs.g2h), tail), desc_read(nxe, (&ct->ctbs.g2h), status),\n"
+     "\t\t\t\t  ct->ctbs.h2g.info.tail, ct->ctbs.g2h.info.head, xe_bo_ggtt_addr(ct->bo), nmx_vf_irq_count,\n"
+     "\t\t\t\t  atomic_read(&nxe->irq.enabled), xe_device_uses_memirq(nxe));\n\t\t}\n", 1)])
++# Wildcat Lake (8086:FD80/FD81). Later Linux lists INTEL_WCL_IDS beside INTEL_PTL_IDS with the same ptl_desc, so 6.14
++# xe takes it as a Panther Lake part (forced, like PTL; see override/xe/nmx_xe_module.c). Its GMD_ID versions are newer
++# than 6.14 knows: later Linux maps Xe3_LPG graphics 30.03-30.05 to graphics_xe2 and Xe3_LPM media 30.02 to the same
++# media IP as 30.00, so those entries are added here. The newer workaround rules for 30.03-30.05 / 30.02 are NOT
++# backported (first bring-up only). Display IP 30.02 stays unknown to 6.14, which logs "Unrecognized display IP version
++# 30.02; disabling display" and runs without display: the firmware framebuffer keeps the panel.
++edit("xe_pci.c", [
++    ("	INTEL_PTL_IDS(INTEL_VGA_DEVICE, &ptl_desc),\n",
++     "	INTEL_PTL_IDS(INTEL_VGA_DEVICE, &ptl_desc),\n	INTEL_VGA_DEVICE(0xFD80, &ptl_desc),\n	INTEL_VGA_DEVICE(0xFD81, &ptl_desc),\n", 1),
++    ("	{ 3001, &graphics_xe2 },\n",
++     "	{ 3001, &graphics_xe2 },\n	{ 3003, &graphics_xe2 },\n	{ 3004, &graphics_xe2 },\n	{ 3005, &graphics_xe2 },\n", 1),
++    ("	{ 3000, &media_xe2 },\n",
++     "	{ 3000, &media_xe2 },\n	{ 3002, &media_xe2 },\n", 1),
++])
+ print("xe fork applied")
+ 
+ # debug.nmxgpu_dump (override/xe/nmx_xe_debug.c): the probed device prints its GuC, queue and fence state on demand
+diff --git a/gpu-port/xkpi/override/xe/nmx_xe_module.c b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+index 3a87a9a..4f2b45b 100644
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+@@ -20,7 +20,8 @@
+ #include "xe_sched_job.h"
+ 
+ /* Panther Lake (Linux 6.14 pciids.h INTEL_PTL_IDS): forced so xe takes it; i915 does not know it */
+-#define NMX_XE_FORCE_PROBE "b080,b081,b082,b090,b091,b092,b0a0,b0a1,b0a2,b0b0"
++/* Wildcat Lake (later Linux pciids.h INTEL_WCL_IDS, which current Linux maps to ptl_desc): fd80, fd81 */
++#define NMX_XE_FORCE_PROBE "b080,b081,b082,b090,b091,b092,b0a0,b0a1,b0a2,b0b0,fd80,fd81"
+ 
+ struct xe_modparam xe_modparam = {
+ 	.force_execlist = false,

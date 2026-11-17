@@ -1,0 +1,40 @@
+Subject: [PATCH 0093] flight recorder: a VFS context of the writing thread for each open
+
+Wildcat Lake test 40 (0092): shutdown got past the unmount wait, then panicked in namei under the flight writer's
+vnode_open (zone_require_ro failed, addr 0, from get_bsdthreadtask_info): the context made at start belonged to the
+attach thread, which had exited. Each drain now makes a context of its own thread for the open and releases it.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_flight.cpp b/gpu-port/xkpi/xnu/nmx_flight.cpp
+index 575e475..cca827f 100644
+--- a/gpu-port/xkpi/xnu/nmx_flight.cpp
++++ b/gpu-port/xkpi/xnu/nmx_flight.cpp
+@@ -351,8 +351,20 @@ static void flight_drain_locked(void)
+     ring_unlock(st0);
+     if (empty)
+         return;
++    /*
++     * A context of this thread for each open: the one made at start belonged to the attach thread, long gone, and a
++     * reopen with it panicked in namei during shutdown (zone_require_ro on its thread's task, test 40).
++     */
++    vfs_context_t start_ctx = gCtx;
++    gCtx = vfs_context_create(nullptr);
++    if (gCtx == nullptr) {
++        gCtx = start_ctx;
++        return;
++    }
+     if (vnode_open(kFlightPath, FWRITE | O_NOFOLLOW, 0644, 0, &gVp, gCtx) != 0) {
+         gVp = nullptr;
++        vfs_context_rele(gCtx);
++        gCtx = start_ctx;
+         return;     /* e.g. the volume is being unmounted: the ring keeps the lines */
+     }
+     for (int pass = 0; pass < 32; pass++) {
+@@ -380,6 +392,8 @@ static void flight_drain_locked(void)
+     VNOP_FSYNC(gVp, MNT_WAIT, gCtx);
+     vnode_close(gVp, FWRITE, gCtx);
+     gVp = nullptr;
++    vfs_context_rele(gCtx);
++    gCtx = start_ctx;
+ }
+ 
+ /* called by the attach once the root file system is up; the ring holds everything printed since the kext loaded */

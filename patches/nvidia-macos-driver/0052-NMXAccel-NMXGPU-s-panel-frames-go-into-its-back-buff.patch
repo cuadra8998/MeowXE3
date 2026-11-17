@@ -1,0 +1,84 @@
+From bb37c4dce4442c4861d873375de3994a8d64f206 Mon Sep 17 00:00:00 2001
+From: nmx <nmx@local>
+Date: Sun, 15 Nov 2026 22:36:11 -0800
+Subject: [PATCH] NMXAccel: NMXGPU's panel frames go into its back buffer and
+ are flipped on at vertical blank
+
+The copy wrote each frame into the buffer the panel was scanning out, and dragging a window tore. When NMXIntelGPUFB
+offers a back buffer (nmxScanoutBack), the frame is copied there and nmxScanoutFlip puts it on the panel at vertical
+blank; no front-buffer re-copy for a flipped frame. Counter: debug.nvaccel_iop_panel_flips. Without a back buffer the
+frame is copied onto the visible one as before.
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 28 +++++++++++++++++++++++++++-
+ 1 file changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index c42f099..c377c83 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -997,6 +997,8 @@ public:
+ 
+ static int    gNvIop = 0;
+ static SInt64 gCntIopOk, gCntIopFail, gCntIopEmpty, gCntIopSrcRes, gCntIopSrcSurf, gCntIopBlank;
++static SInt64 gCntIopPanelFlips;   // NMXGPU's panel: frames flipped on at vertical blank
++static const OSSymbol *gSymScanBack = nullptr, *gSymScanFlip = nullptr;   // NMXGPU's panel flips
+ static SInt64 gCntIopOkHead[kNvMaxFB];
+ #define NVIOP_LOG_MAX 40
+ static unsigned gIopLogs = 0;
+@@ -1260,6 +1262,24 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+     if (w != q.width || h != q.height) NVIOP_FAIL(kIOReturnBadArgument, "source %ux%u is not the scanout's %ux%u", w, h, q.width, q.height);
+ 
+     nvAccelIopHome(fb, head);
++#ifdef NMX_ACCEL
++    // NMXGPU's panel double-buffers: the frame goes into the buffer that is not on the panel and is then flipped onto
++    // it at vertical blank (nmxScanoutFlip). Copied onto the visible buffer, a frame tore (dragging a window).
++    if (!gSymScanBack) gSymScanBack = OSSymbol::withCStringNoCopy("nmxScanoutBack");
++    if (!gSymScanFlip) gSymScanFlip = OSSymbol::withCStringNoCopy("nmxScanoutFlip");
++    const OSSymbol *symBack = gSymScanBack, *symFlip = gSymScanFlip;
++    bool toBack = false;
++    if (gNmxVmDisplay && symBack && symFlip && fb->metaCast("NMXIntelGPUFB")) {
++        struct NVRMVramRequest bq;
++        for (unsigned i = 0; i < sizeof bq; i++) ((volatile unsigned char *)&bq)[i] = 0;
++        bq.version = NVRM_VRAM_ABI_VERSION;
++        if (fb->callPlatformFunction(symBack, false, &bq, nullptr, nullptr, nullptr) == kIOReturnSuccess && bq.kva &&
++            bq.pitch == q.pitch && bq.width == q.width && bq.height == q.height) {
++            q.kva = bq.kva;
++            toBack = true;
++        }
++    }
++#endif
+     const unsigned words = (((pitch < q.pitch) ? pitch : q.pitch) & ~3u) / 4;
+     const unsigned spr = pitch / 4, dpr = q.pitch / 4;
+     volatile unsigned int *d = (volatile unsigned int *)q.kva;
+@@ -1270,6 +1290,11 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+     }
+     OSAddAtomic64(1, fromRes ? &gCntIopSrcRes : &gCntIopSrcSurf);
+ #ifdef NMX_ACCEL
++    if (toBack) {
++        if (fb->callPlatformFunction(symFlip, false, nullptr, nullptr, nullptr, nullptr) == kIOReturnSuccess)
++            OSAddAtomic64(1, &gCntIopPanelFlips);
++        fromRes = true;   // no front-buffer re-copy of this frame: it was flipped, not written onto the panel
++    }
+     // the copy source of a VM display becomes its front buffer (a resource's memory can go away under us: not those)
+     if (gNmxVmDisplay && gNmxFrontLock) {
+         if (fromRes) gNmxFront.src = nullptr;
+@@ -1380,6 +1405,7 @@ NVACCEL_CNT(nvaccel_iop_src_res,      gCntIopSrcRes,      "K3: frames sourced fr
+ NVACCEL_CNT(nvaccel_iop_src_surf,     gCntIopSrcSurf,     "K3: frames sourced from the IOSurface memory");
+ NVACCEL_CNT(nvaccel_iop_blank,        gCntIopBlank,       "K6: frames copied whose 64 samples were all ONE colour (a blank frame)");
+ static SInt64 gCntIopCopySkip;
++NVACCEL_CNT(nvaccel_iop_panel_flips,  gCntIopPanelFlips,  "NMXGPU's panel: frames copied into the back buffer and flipped on at vertical blank");
+ NVACCEL_CNT(nvaccel_iop_copy_skip,    gCntIopCopySkip,    "frames kept on the panel because the surface's newest pixels were not yet in system memory");
+ static int    gIopFlip = 0;
+ static SInt64 gCntIopFlip, gCntIopFlipHome, gCntIopFlipNo[8];
+@@ -1476,7 +1502,7 @@ static void nmxInstallVmSysctls(void)
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_ok);         sysctl_register_oid(&sysctl__debug_nvaccel_iop_fail);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_empty);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_res);    sysctl_register_oid(&sysctl__debug_nvaccel_iop_src_surf);
+-    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
++    sysctl_register_oid(&sysctl__debug_nvaccel_iop_blank);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_panel_flips);      sysctl_register_oid(&sysctl__debug_nvaccel_iop_copy_skip);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip);       sysctl_register_oid(&sysctl__debug_nvaccel_iop_flips);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_home);  sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_lock);
+     sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_novram); sysctl_register_oid(&sysctl__debug_nvaccel_iop_flip_stale);
+-- 
+2.50.1 (Apple Git-155)
+

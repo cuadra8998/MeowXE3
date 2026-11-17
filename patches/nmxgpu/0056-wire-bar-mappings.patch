@@ -1,0 +1,172 @@
+Subject: [PATCH 0056] Hand out a BAR mapping only when every page is in the page tables
+
+Wildcat Lake test starts 2 and 3 (with 0055's checkpoints) panicked identically:
+  page fault (write, not present) at BAR0 + 0xa188 in xe_mmio_write32
+  <- xe_force_wake_get <- xe_gt_init_hwconfig <- xe_device_probe <- xe_pci_probe, RFLAGS IF = 0
+xnu can enter kernel mappings of device memory into the page tables lazily, on first touch. FORCEWAKE_GT (0xa188) is
+written under spin_lock_irqsave, on a page of BAR0 that had not been touched yet, so the fault could not be resolved.
+Earlier register accesses (GMD_ID, the pcode mailbox at 0x138124) ran with interrupts on and worked.
+Test 3 wired the mapping (IOMemoryMap::wireRange) and still panicked the same way, so the result is now checked.
+
+- xnu/nmx_pci.cpp: nmx_xnu_pci_map_bar counts the mapping's pages without a page-table entry (pmap_find_phys, which
+  reads only the page tables, never the device), as mapped, then after wireRange, then mapped with kIOMapStatic, and
+  hands out the first mapping with none missing. If none gets there the BAR is refused (xe then fails to probe with
+  "failed to map registers" instead of panicking). It logs every count and the choice:
+    "NullMoth: BAR 0x10 (16384 KiB): pages missing as mapped N, wired N (0x..), static N -> wired|as mapped|static|refused"
+  New nmx_xnu_pci_unmap_bar unwires (only what it wired) and releases.
+- bsdcompat/src/nmx_bus.c: BAR resources are released through nmx_xnu_pci_unmap_bar.
+- bsdcompat/include/{,nmxxnu/}nmx_xnu.h: its declaration.
+
+Applies on top of 0051-0055.
+
+diff --git a/gpu-port/xkpi/xnu/nmx_pci.cpp b/gpu-port/xkpi/xnu/nmx_pci.cpp
+--- a/gpu-port/xkpi/xnu/nmx_pci.cpp
++++ b/gpu-port/xkpi/xnu/nmx_pci.cpp
+@@ -50,6 +50,12 @@
+     *func = d->getFunctionNumber();
+ }
+ 
++/* a BAR's kernel mapping and whether nmx_xnu_pci_map_bar wired it (so it is unwired before it goes) */
++struct NMXBarMap {
++    IOMemoryMap *map;
++    bool wired;
++};
++
+ static IOOptionBits cache_option(int cache)
+ {
+     switch (cache) {
+@@ -60,6 +66,29 @@
+     }
+ }
+ 
++extern "C" {
++extern void *kernel_pmap;
++extern ppnum_t pmap_find_phys(void *pmap, addr64_t va);
++}
++
++/* pages of [va, va+len) with no page-table entry yet; pmap_find_phys only reads the page tables, never the device */
++static uint64_t bar_missing_pages(IOMemoryMap *map)
++{
++    uint64_t va = map->getVirtualAddress(), len = map->getLength(), missing = 0;
++    for (uint64_t off = 0; off < len; off += PAGE_SIZE)
++        if (pmap_find_phys(kernel_pmap, (addr64_t)(va + off)) == 0)
++            missing++;
++    return missing;
++}
++
++/*
++ * xnu can enter a kernel mapping of device memory into the page tables lazily, on the first touch of each page. A
++ * first touch with interrupts off cannot be resolved and panics (Wildcat Lake: xe_force_wake_get writes FORCEWAKE_GT
++ * under spin_lock_irqsave, on a page of BAR0 not touched before). So a BAR is handed out only once every page of its
++ * mapping is in the page tables: first as mapped, then wired (IOMemoryMap::wireRange), then mapped with kIOMapStatic.
++ * If none gets there the BAR is refused: the driver fails to probe instead of panicking later. Nothing here reads
++ * the device.
++ */
+ extern "C" void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uint64_t *size, void **handle)
+ {
+     IOPCIDevice *d = (IOPCIDevice *)pci;
+@@ -69,15 +98,65 @@
+     IODeviceMemory *mem = d->getDeviceMemoryWithRegister((UInt8)bar_reg);
+     if (mem == nullptr)
+         return nullptr;
++    NMXBarMap *bm = IONew(NMXBarMap, 1);
++    if (bm == nullptr)
++        return nullptr;
++    bm->map = nullptr;
++    bm->wired = false;
++    uint64_t miss_plain = ~0ULL, miss_wired = ~0ULL, miss_static = ~0ULL;
++    IOReturn wr = kIOReturnSuccess;    /* wireRange result, logged when it was tried */
++
+     IOMemoryMap *map = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | cache_option(cache));
+-    if (map == nullptr)
++    if (map != nullptr) {
++        miss_plain = bar_missing_pages(map);
++        if (miss_plain != 0) {
++            wr = map->wireRange(kIODirectionInOut, 0, map->getLength());
++            bm->wired = wr == kIOReturnSuccess;
++            miss_wired = bar_missing_pages(map);
++        }
++        if (miss_plain == 0 || miss_wired == 0) {
++            bm->map = map;
++        } else {
++            if (bm->wired)
++                map->wireRange(kIODirectionNone, 0, map->getLength());
++            bm->wired = false;
++            map->release();
++        }
++    }
++    if (bm->map == nullptr) {
++        map = mem->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapStatic | cache_option(cache));
++        if (map != nullptr) {
++            miss_static = bar_missing_pages(map);
++            if (miss_static == 0)
++                bm->map = map;
++            else
++                map->release();
++        }
++    }
++    IOLog("NullMoth: BAR 0x%x (%llu KiB): pages missing as mapped %lld, wired %lld (0x%x), static %lld -> %s\n",
++          bar_reg, (unsigned long long)(mem->getLength() >> 10), (long long)miss_plain, (long long)miss_wired, wr,
++          (long long)miss_static, bm->map == nullptr ? "refused" : bm->wired ? "wired" : miss_plain == 0 ? "as mapped" : "static");
++    if (bm->map == nullptr) {
++        IODelete(bm, NMXBarMap, 1);
+         return nullptr;
+-    *phys = map->getPhysicalAddress();
+-    *size = map->getLength();
+-    *handle = map;
+-    return (void *)(uintptr_t)map->getVirtualAddress();
++    }
++    *phys = bm->map->getPhysicalAddress();
++    *size = bm->map->getLength();
++    *handle = bm;
++    return (void *)(uintptr_t)bm->map->getVirtualAddress();
+ }
+ 
++extern "C" void nmx_xnu_pci_unmap_bar(void *handle)
++{
++    NMXBarMap *bm = (NMXBarMap *)handle;
++    if (bm == nullptr)
++        return;
++    if (bm->wired)
++        bm->map->wireRange(kIODirectionNone, 0, bm->map->getLength());
++    bm->map->release();
++    IODelete(bm, NMXBarMap, 1);
++}
++
+ extern "C" int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io)
+ {
+     IOPCIDevice *d = (IOPCIDevice *)pci;
+diff --git a/gpu-port/xkpi/bsdcompat/src/nmx_bus.c b/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
+--- a/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
++++ b/gpu-port/xkpi/bsdcompat/src/nmx_bus.c
+@@ -823,7 +823,7 @@
+     if (rle != NULL && rle->res == r)
+         rle->res = NULL;
+     if (r->map_handle)
+-        nmx_xnu_unmap(r->map_handle);
++        nmx_xnu_pci_unmap_bar(r->map_handle);
+     free(r, M_NMXBUS);
+     return 0;
+ }
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmx_xnu.h
+@@ -73,6 +73,7 @@
+ void nmx_xnu_pci_location(void *pci, uint32_t *domain, uint8_t *bus, uint8_t *dev, uint8_t *func);
+ /* maps BAR at config register 'bar_reg' (0x10..0x24); returns the kernel address, its physical base and size */
+ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uint64_t *size, void **handle);
++void nmx_xnu_pci_unmap_bar(void *handle);	/* releases what nmx_xnu_pci_map_bar returned in 'handle' */
+ /* BAR at config register 'bar_reg' as IOKit assigned it (never sized by writing the BAR); 0 = no such BAR */
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
+diff --git a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+--- a/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
++++ b/gpu-port/xkpi/bsdcompat/include/nmxxnu/nmx_xnu.h
+@@ -73,6 +73,7 @@
+ void nmx_xnu_pci_location(void *pci, uint32_t *domain, uint8_t *bus, uint8_t *dev, uint8_t *func);
+ /* maps BAR at config register 'bar_reg' (0x10..0x24); returns the kernel address, its physical base and size */
+ void *nmx_xnu_pci_map_bar(void *pci, int bar_reg, int cache, uint64_t *phys, uint64_t *size, void **handle);
++void nmx_xnu_pci_unmap_bar(void *handle);	/* releases what nmx_xnu_pci_map_bar returned in 'handle' */
+ /* BAR at config register 'bar_reg' as IOKit assigned it (never sized by writing the BAR); 0 = no such BAR */
+ int nmx_xnu_pci_bar_info(void *pci, int bar_reg, uint64_t *phys, uint64_t *size, int *is_io);
+ /* message-signalled interrupts: number available, and handler registration (handler runs on a work loop thread) */
