@@ -190,14 +190,51 @@ Every app is allowed by default (`*` in `/Library/GPUBundles/nvmtl-allow.txt`). 
 
 The binaries (about 340 MB, including LLVM) are in the release zip, not in git.
 
-## License and credits
+## Credits
 
-MeowXE3 is a renamed, modified build of [NullMoth](https://github.com/nullmoth/nvidia-macos-driver) with patches by
-ericek111 and the MeowXE3 patches in this repository. It is under the **PolyForm Noncommercial 1.0.0** license
-(`LICENSE-NullMoth.md`): **noncommercial use only**, and keep the notice.
+MeowXE3 stands on other people's work. Thank you to:
+
+### The driver
+
+| Who | What MeowXE3 uses |
+|---|---|
+| [**NullMoth**](https://github.com/nullmoth) ([nvidia-macos-driver](https://github.com/nullmoth/nvidia-macos-driver)) | the foundation. NMXGPU (Linux's `xe` driver on a FreeBSD LinuxKPI port to the macOS kernel), the NMXAccel accelerator, the NVMTL Metal-to-Vulkan driver and shader translator, NMXAudio, and the "start once without driver" boot tool. MeowXE3 is a renamed, modified build of it |
+| [**ericek111**](https://github.com/ericek111) ([vibe-nullmoth-xe3-qemu](https://github.com/ericek111/vibe-nullmoth-xe3-qemu)) | the Intel Xe3 groundwork: the xkpi, drm-kmod, Mesa (ANV on macOS), libdrm and plugin patch series, NMXAGDC, and the shader translator fixes MeowXE3 builds on |
+| [**HighDelay**](https://github.com/HighDelay) ([nvidia-macos-driver-nvk](https://github.com/HighDelay/nvidia-macos-driver-nvk)) | OpenGL through Zink: the pinned Zink setup (`prepare_zink.py`) and the CGL/GLD bridge that MeowXE3's Zink runs on |
+| [**watchthelight**](https://github.com/watchthelight) | NullMoth plugin fixes ported here: heap texture swizzles (yellow icons on Intel), buffer memory types, and the restored Dock blur sampler |
+| [**daggersinmybackk**](https://github.com/daggersinmybackk) | the drawable usage fix that lets Core Image render into window textures (NullMoth #433) |
+| modest-tao | NullMoth's storage-twin writes and one-image-per-IOSurface work, which the camera work builds on |
+
+### Upstream projects
+
+| Project | Used for |
+|---|---|
+| [Linux](https://github.com/torvalds/linux) (Intel `xe` and display code) | the GPU and display driver itself |
+| [FreeBSD](https://github.com/freebsd/freebsd-src) and [drm-kmod](https://github.com/freebsd/drm-kmod) | LinuxKPI, the DRM core, and the HD Audio driver |
+| [Mesa](https://gitlab.freedesktop.org/mesa/mesa) | ANV (Intel Vulkan) and Zink (OpenGL on Vulkan) |
+| [libdrm](https://gitlab.freedesktop.org/mesa/drm) | the userspace side of the GPU driver |
+| [LLVM](https://github.com/llvm/llvm-project) and [zstd](https://github.com/facebook/zstd) | shader compilation and compression in the Metal driver |
+| [Intel linux-firmware](https://gitlab.com/kernel-firmware/linux-firmware) | the GuC, HuC and DMC firmware |
+
+### The OpenCore setup (EFI-X1504MA)
+
+| Who | What |
+|---|---|
+| [**acidanthera**](https://github.com/acidanthera) | [OpenCore](https://github.com/acidanthera/OpenCorePkg), [Lilu](https://github.com/acidanthera/Lilu), [VirtualSMC](https://github.com/acidanthera/VirtualSMC), [VoodooPS2](https://github.com/acidanthera/VoodooPS2), [NVMeFix](https://github.com/acidanthera/NVMeFix), [RestrictEvents](https://github.com/acidanthera/RestrictEvents), [BrightnessKeys](https://github.com/acidanthera/BrightnessKeys), BlueToolFixup ([BrcmPatchRAM](https://github.com/acidanthera/BrcmPatchRAM)) |
+| [**OpenIntelWireless**](https://github.com/OpenIntelWireless) | [AirportItlwm](https://github.com/OpenIntelWireless/itlwm) (Wi-Fi), [IntelBluetoothFirmware](https://github.com/OpenIntelWireless/IntelBluetoothFirmware) |
+| [**VoodooI2C**](https://github.com/VoodooI2C) | [VoodooI2C](https://github.com/VoodooI2C/VoodooI2C) (trackpad) |
+| [**dhinakg**](https://github.com/dhinakg) | [USBToolBox](https://github.com/USBToolBox/kext), AMFIPass |
+| [**averycblack**](https://github.com/averycblack) | [ECEnabler](https://github.com/averycblack/ECEnabler) (battery readings) |
+| [**corpnewt**](https://github.com/corpnewt) | [GenSMBIOS](https://github.com/corpnewt/GenSMBIOS), for making your own serials |
+
+## License
+
+MeowXE3 is a renamed, modified build of [NullMoth](https://github.com/nullmoth/nvidia-macos-driver), with patches by
+[ericek111](https://github.com/ericek111) and the MeowXE3 patches in this repository. It is under the **PolyForm
+Noncommercial 1.0.0** license (`LICENSE-NullMoth.md`): **noncommercial use only**, and keep the notice.
 
 Required Notice: Copyright (c) 2026 NullMoth Systems (https://nullmothsystems.com)
 
 These parts keep their own licenses: Mesa (MIT), libdrm (MIT), the Linux xe/i915 code (MIT/GPL-2.0, as marked in each
 file), LLVM (Apache-2.0 with LLVM exception), zstd (BSD), and Intel's linux-firmware blobs (redistribution allowed
-under Intel's license). See `NOTICE.md`.
+under Intel's license). See `NOTICE.md`. The OpenCore kexts keep their authors' licenses.
