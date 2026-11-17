@@ -184,7 +184,8 @@ Every app is allowed by default (`*` in `/Library/GPUBundles/nvmtl-allow.txt`). 
 | `tools/tests/` | Metal regression tests (compute, render, mipmapped buffer textures) |
 | `tools/com.meowxe3.java-vulkan.plist` | optional LaunchAgent: every Java program uses MeowXE3's Vulkan driver |
 | `src/MeowXE3Boot/` | the small OpenCore-injected kext |
-| `docs/` | [findings and open problems](docs/FINDINGS.md), [X1504MA brightness keys](docs/X1504MA-brightness-keys.md) |
+| `docs/` | [continuing the work](docs/CONTINUING.md) (sources, pins, rebuilding, open threads), [findings and open problems](docs/FINDINGS.md), [X1504MA brightness keys](docs/X1504MA-brightness-keys.md) |
+| `patches/base/`, `patches/experimental/` | NullMoth's Mesa/libdrm base patches; unreleased work (camera) |
 | `EFI-X1504MA/` | the OpenCore EFI this was developed on (serials removed), as a reference |
 
 The binaries (about 340 MB, including LLVM) are in the release zip, not in git.

@@ -1,0 +1,14 @@
+--- a/gpu-port/xkpi/bsdcompat/include/sys/systm.h
++++ b/gpu-port/xkpi/bsdcompat/include/sys/systm.h
+@@ -59,7 +59,11 @@
+ #define fueword64(b, v) (copyin((const void *)(b), (v), sizeof(int64_t)) ? -1 : 0)
+ #define subyte(u, c) (subyte)((user_addr_t)(uintptr_t)(u), (c))
+ #define fubyte(u) (fubyte)((user_addr_t)(uintptr_t)(u))
++#ifdef NMX_BOOTVERBOSE
++#define bootverbose 1   /* MeowXE3Audio diagnostic build: FreeBSD drivers print what they find */
++#else
+ #define bootverbose 0
++#endif
+ #define SCHEDULER_STOPPED() 0
+ #define KERNEL_PANICKED() 0
+ #define panicstr ((const char *)0)
