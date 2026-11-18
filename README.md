@@ -27,7 +27,7 @@ A Custom Vulkan to Metal DriverStack for Graphics Acceleration of Intel XE3 Pant
 | Brightness slider | ✅ Works | |
 | Brightness keys | ✅ Works | X1504MA needs two DSDT edits: [guide](docs/X1504MA-brightness-keys.md) |
 | Shutdown / restart | ✅ Works | |
-| Wi-Fi |  ✅ Works | | changed for a Intel Wi-Fi Card |
+| Wi-Fi |  ✅ Works | changed for a Intel Wi-Fi Card |
 | HDMI display | ⚠️ Partly | works only if the monitor is connected **when the Mac boots**; plugging it in later doesn't. Same image as the built-in panel (no extended desktop). **No HDMI audio** |
 | USB-C / DisplayPort display | ⚠️ Untested | |
 | Panther Lake, Wildcat Lake `FD81` | ⚠️ Untested | in the driver, never run on real hardware |
