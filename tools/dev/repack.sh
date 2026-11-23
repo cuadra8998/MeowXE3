@@ -3,6 +3,7 @@
 #   NMXGPU   ~/nmx/out/NMXGPU.kext
 #   NMXAccel ~/nmx/src/nmxaccel-nmxgpu/NMXAccel.kext
 #   NMXAGDC  ~/nmx/src/nmxagdc-out/NMXAGDC.kext
+# MEOWXE3_ACCEL=<dir with NMXAccel.kext> picks another accelerator build (build-sequoia.sh passes the macOS 15 one).
 # Renames them (com.meowxe3.*), sets VERSION on all three (kmutil only rebuilds the auxiliary collection when a version
 # or binary changes), keeps the license files, re-signs ad hoc. Then: sudo bash install-meowxe3.sh
 set -euo pipefail
@@ -10,7 +11,7 @@ V=${1:?usage: repack.sh VERSION (e.g. 1.0.2)}
 HERE=$(cd "$(dirname "$0")" && pwd); K=$HERE/MeowXE3.kext; PB=/usr/libexec/PlistBuddy
 TMP=$(mktemp -d); cp -R "$K/Contents/Resources" "$TMP/Resources"
 rm -rf "$K"; ditto "$HOME/nmx/out/NMXGPU.kext" "$K"; mkdir -p "$K/Contents/PlugIns"
-ditto "$HOME/nmx/src/nmxaccel-nmxgpu/NMXAccel.kext" "$K/Contents/PlugIns/MeowXE3Accel.kext"
+ditto "${MEOWXE3_ACCEL:-$HOME/nmx/src/nmxaccel-nmxgpu}/NMXAccel.kext" "$K/Contents/PlugIns/MeowXE3Accel.kext"
 ditto "$HOME/nmx/src/nmxagdc-out/NMXAGDC.kext" "$K/Contents/PlugIns/MeowXE3AGDC.kext"
 rm -rf "$K/Contents/Resources"; cp -R "$TMP/Resources" "$K/Contents/Resources"; rm -rf "$TMP"
 ren() { # kext oldexe newexe newid

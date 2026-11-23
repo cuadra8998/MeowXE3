@@ -52,10 +52,11 @@ expects the build root in `NULLMOTH_BUILD_ROOT` (we used `~/nmx`).
 | NMXGPU, after xe / runtime changes | `... ./build-guest.sh xert ~/nmx/out` (the shared ID header needs this too) |
 | NMXAccel | `tools/build/build-nmxaccel.sh` (needs NVIDIA open-gpu-kernel-modules 610.57.04 headers in `~/nmx/src/ogkm610`) |
 | NMXAGDC | `~/nmx/src/nvmd/kexts/NMXAGDC/build.sh <out>` |
-| Metal plugin | `cd ~/nmx/src/nvmd/plugin && xcrun clang -arch x86_64 -bundle -fobjc-arc -O1 -Wno-protocol -Wno-incomplete-implementation -I$HOME/nmx/src/mesa/include -o ~/nmx/src/nvmtl-out/NVMTLDriver NVMTLDevice.m -framework Foundation -framework Metal -framework IOSurface -framework IOKit` |
+| Metal plugin | `cd ~/nmx/src/nvmd/plugin && xcrun clang -arch x86_64 -mmacosx-version-min=15.0 -bundle -fobjc-arc -O1 -Wno-protocol -Wno-incomplete-implementation -I$HOME/nmx/src/mesa/include -o ~/nmx/src/nvmtl-out/NVMTLDriver NVMTLDevice.m -framework Foundation -framework Metal -framework IOSurface -framework IOKit` |
 | Shader translator | `~/nmx/src/nvmd/build/build_xlate.sh`, install with `tools/build/install-translator.sh` |
 | Mesa ANV / Vulkan WSI | `tools/build/build-mesa.sh` (`wsi-configure`, `wsi-build`), `tools/build/install-vk-wsi.sh` |
 | Zink | `tools/build/build-zink.sh`, `tools/build/install-zink-update.sh` |
+| Sequoia release | `tools/build/build-sequoia.sh <version> <NullMothSafe.efi>` after the Tahoe package is built ([SEQUOIA.md](SEQUOIA.md)) |
 | Package + release | `tools/dev/repack.sh <version>` (bump it, or kmutil won't rebuild) then `tools/dev/make-release.sh <version> ~/nmx/MeowXE3 <NullMothSafe.efi>` |
 
 **Before installing a new kext:** compare `nm -u` with the installed one. Run the Metal tests in `tools/tests`

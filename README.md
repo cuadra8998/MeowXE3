@@ -44,6 +44,9 @@ Details and what has been tried: [docs/FINDINGS.md](docs/FINDINGS.md).
 
 **Tested on:** ASUS Vivobook X1504MA, Intel Wildcat Lake `8086:FD80`, macOS Tahoe 26.7, OpenCore 1.0.8.
 
+**macOS Sequoia (15.5 or newer):** a separate `MeowXE3-<version>-sequoia.zip` build, **untested on hardware**. Only the
+accelerator kext differs from the Tahoe build; see [docs/SEQUOIA.md](docs/SEQUOIA.md).
+
 **In the driver but never run on real hardware:** Wildcat Lake `FD81`, and Panther Lake `B080`–`B087`, `B08F`, `B090`–`B092`,
 `B0A0`–`B0A2`, `B0B0`. They use the same firmware family and display generation, so they have a fair chance, but expect
 problems. The installer warns you, and reports from these machines are very welcome.
@@ -112,7 +115,7 @@ flowchart TB
 
 ## Install
 
-1. Download `MeowXE3-<version>.zip` from [Releases](../../releases) and unzip it.
+1. Download `MeowXE3-<version>.zip` (Tahoe) or `MeowXE3-<version>-sequoia.zip` (Sequoia 15.5+) from [Releases](../../releases) and unzip it.
 2. Right-click **`Install MeowXE3.command`** > **Open** (macOS blocks a plain double-click on downloaded scripts),
    or in Terminal: `sudo bash ~/Downloads/MeowXE3-<version>/Install\ MeowXE3.command`
 3. Choose **[1] install everything**, approve MeowXE3 in System Settings > Privacy & Security if asked, restart.

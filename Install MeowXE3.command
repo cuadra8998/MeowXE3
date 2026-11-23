@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================================================
-#  MeowXE3 installer - Intel Xe3 (Wildcat Lake) graphics acceleration for macOS Tahoe on OpenCore
+#  MeowXE3 installer - Intel Xe3 (Wildcat Lake) graphics acceleration for macOS Tahoe / Sequoia on OpenCore
 #  Double-click it (right-click > Open the first time), or:  sudo bash "Install MeowXE3.command"
 #  Options: --dry-run   check everything and show the OpenCore changes on a copy; change nothing
 #           --fast      skip the eye candy
@@ -9,6 +9,8 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 PAY=$HERE/payload
 VERSION=$(cat "$PAY/VERSION" 2>/dev/null || echo "?")
+TARGET=$(cat "$PAY/TARGET" 2>/dev/null || echo 26)   # macOS major the payload was built for (no file: older Tahoe releases)
+case $TARGET in 15) OSNAME="Sequoia";; *) OSNAME="Tahoe";; esac
 DRY=0; FAST=${MEOWXE3_FAST:-0}
 for a in "$@"; do case $a in --dry-run) DRY=1;; --fast) FAST=1;; esac; done
 LOG=/Users/Shared/MeowXE3-install.log
@@ -52,7 +54,7 @@ banner() {
 EOF
   printf '%s' "$GRN"
   cat <<EOF
-        /\\_/\\      Intel Xe3 graphics acceleration for macOS Tahoe
+        /\\_/\\      Intel Xe3 graphics acceleration for macOS $OSNAME
        ( o.o )     Metal  *  Vulkan  *  OpenGL (Zink)  *  GPU compositing
         > ^ <      version $VERSION            :: ALPHA - use at your own risk ::
 EOF
@@ -85,7 +87,16 @@ check_system() { # sets CHECK_FAILED / CHECK_WARN
   CHECK_FAILED=0; CHECK_WARN=0
   say "  :: scanning system ::"; pace 0.3
   local mv; mv=$(sw_vers -productVersion)
-  if [[ "$mv" == 26.* ]]; then ok "macOS $mv (Tahoe)"; else warn "macOS $mv - MeowXE3 is built for Tahoe (26.x)"; CHECK_WARN=1; fi
+  local major=${mv%%.*} minor; minor=${mv#*.}; minor=${minor%%.*}; [[ "$minor" =~ ^[0-9]+$ ]] || minor=0
+  if [ "$major" = "$TARGET" ]; then
+    if [ "$TARGET" = 15 ] && [ "$minor" -lt 5 ]; then
+      bad "macOS $mv - the Sequoia build needs 15.5 or newer (OpenGL/Zink is built for 15.5); update macOS first"; CHECK_FAILED=1
+    else ok "macOS $mv ($OSNAME)"; fi
+    [ "$TARGET" = 15 ] && { warn "Sequoia build: new, not yet tested on real hardware - keep the 'start once without driver' entry handy"; CHECK_WARN=1; }
+  elif [ "$major" = 15 ] || [ "$major" = 26 ]; then
+    bad "macOS $mv, but this download is the $OSNAME (macOS $TARGET) build - get the $( [ "$major" = 15 ] && echo "-sequoia" || echo "Tahoe") zip from Releases"
+    say "         (the GPU accelerator kext differs between Sequoia and Tahoe; the wrong one leaves a black or frozen desktop)"; CHECK_FAILED=1
+  else bad "macOS $mv - MeowXE3 supports Sequoia 15.5+ and Tahoe 26.x only"; CHECK_FAILED=1; fi
   if [ "$(uname -m)" = x86_64 ]; then ok "Intel Mac kernel (x86_64)"; else bad "this is not an x86_64 Mac"; CHECK_FAILED=1; fi
   local id; id=$(gpu_id)
   if [[ " $SUPPORTED " == *" $id "* ]]; then ok "GPU 8086:$(echo "$id" | tr a-f A-F) Wildcat Lake Xe3 (tested)"
