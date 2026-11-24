@@ -25,6 +25,8 @@ zero bytes now: put your network card's MAC address there.
   - `amfi_get_out_of_my_way=0x1 amfi=0x80 ipc_control_port_options=0` lets apps load the Metal driver. This lowers macOS
     security.
   - `-v keepsyms=1 debug=0x100` are for debugging.
+  - `revcpu=1` (RestrictEvents) makes About This Mac show the real CPU ("Intel(R) Core(TM) 5 315") instead of the
+    MacBookPro16,2 model's "6-Core Intel Core i5".
 - **NVRAM:** `nullmoth-fbflags` = `1833`, written every boot. `csr-active-config` = `430A0000`, which loosens SIP so
   unsigned kexts load.
 
