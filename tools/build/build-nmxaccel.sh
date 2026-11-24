@@ -28,7 +28,7 @@ RMDEFS=( -D__NO_CTYPE -DLOCK_VAL_ENABLED=0 -DPORT_ATOMIC_64_BIT_SUPPORTED=1 -DPO
   -DINCLUDE_NVLINK_LIB -DINCLUDE_NVSWITCH_LIB -DNV_PRINTF_STRINGS_ALLOWED=1 -DNV_ASSERT_FAILED_USES_STRINGS=1
   -DPORT_ASSERT_FAILED_USES_STRINGS=1 -DNV_X86_64 -DNV_ARCH_BITS=64 )
 CFLAGS=( -arch x86_64 -fapple-kext -mkernel -nostdinc -I"$KHDR" -I"$SRC" "${RMINC[@]}" "${KMSINC[@]}"
-  -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT "${RMDEFS[@]}" -DNMX_ACCEL "${TAHOE[@]}" -mmacosx-version-min=15.0
+  -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE -DAPPLE -DNeXT "${RMDEFS[@]}" -DNMX_ACCEL ${TAHOE[@]+"${TAHOE[@]}"} -mmacosx-version-min=15.0
   -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common
   -Wall -Wno-unused-parameter -Wno-inconsistent-missing-override -Wno-unused-function -O2 )
 xcrun clang++ "${CFLAGS[@]}" -I"$SRC/accel" -I"$SRC/accel/iofam" -I"$RE" -c "$SRC/accel/nvrm-accel.cpp" -o "$OUT/nmx-accel.o" 2>"$OUT/nmxaccel.err" || { grep -m12 -A3 "error" "$OUT/nmxaccel.err"; exit 1; }
