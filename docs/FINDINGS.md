@@ -57,6 +57,17 @@ preview through Core Image on the Metal driver.
 Safari's WebContent sandbox blocks the Metal driver bundle. NullMoth's NVWebKitFixup approach would work but weakens
 Safari's sandbox; not done.
 
+### Animation speed (Launchpad, Mission Control)
+- **Cause found (1.0.13, Sequoia):** with the panel's copy path, WindowServer waited for the GPU after every Metal flush
+  (`CompositorMetal::composite` → `commitAndWaitUntilSubmitted` → `waitUntilCompleted`, also for each blur pass and
+  CoreDisplay's `AccessComplete`). CPU and GPU took turns, the GPU idled half the time, and its clock stayed at RPe
+  (900 MHz of 2300). Launchpad: 25-30 fps, 35-68 ms frames. The vblank timer (±1.2 ms) and the copy (~1 ms) were not it.
+- **Fix (patch 0063):** ordered frames on the panel. WindowServer no longer waits; a thread call copies each frame once
+  its command buffers are published, then completes the transaction. 38 fps, long gaps 179 → 65 in 12 s.
+  `debug.nmxfb_blob_ordered=0` switches back live.
+- **Next:** the GPU clock under compositing (SLPC only ramps under near-constant load), and the CPU side of encoding
+  (`MetalCompositeCoreAnimation`, about a third of WindowServer's frame time). Measure with `tools/tests/frame-gaps.m`.
+
 ### Others
 - **Minecraft 1.12.2 on Zink:** ~30 fps, limited by presentation copies.
 - **Panther Lake / FD81:** IDs are in the driver (0108/0109) but never run on hardware.

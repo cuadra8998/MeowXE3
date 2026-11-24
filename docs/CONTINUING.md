@@ -80,6 +80,11 @@ apps pick up the new plugin when relaunched, and WindowServer at the next login.
 2. **HDMI hot-plug:** `bridge_hotplug` in `override/src/nmx_fb_bridge.c`. It re-commits outside `flip_lock` and caps
    modes at the panel size.
 3. **Sleep:** S3 fails in firmware (wake code `0x1f`). `tools/build/sleep-test.sh` records a run.
+   **Hibernation (S4)** is the way around it and is wanted. [Issue #1](https://github.com/cuadra8998/MeowXE3/issues/1)
+   (Lunar Lake, `hibernatemode 25`): the machine resumes and xe works, but NMXAccel never presents again (no
+   `nmxScanoutBack`/`nmxScanoutFlip`, no `displayModeWillChange/DidChange`). NMXAccel has no sleep/wake code of its own
+   (only the framebuffer kexts do). Start by checking whether the display pipe stays busy (`isTransactionComplete`)
+   and what the head reports after wake.
 4. **Audio:** only via SOF + SoundWire + RT721 (large), or USB/Bluetooth. Don't retry plain HD Audio for the speakers.
 5. **Safari:** port NullMoth's NVWebKitFixup, only with the user's OK.
 6. **Minecraft 1.12.2 speed:** Zink presentation copies (~30 fps).

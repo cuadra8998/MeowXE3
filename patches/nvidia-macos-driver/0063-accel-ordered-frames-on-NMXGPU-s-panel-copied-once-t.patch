@@ -1,0 +1,239 @@
+From b385ed41b05e66d02207e3d67349ddaa1dabb8bd Mon Sep 17 00:00:00 2001
+From: cuadra8998 <cuadra8998@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 18:40:57 -0800
+Subject: [PATCH] accel: ordered frames on NMXGPU's panel (copied once the GPU
+ has published them)
+
+WindowServer waited for the GPU after every Metal flush on the panel
+(commitAndWaitUntilSubmitted -> waitUntilCompleted) so the transaction's
+copy found finished pixels: a frame cost its CPU encoding plus its GPU
+time, the GPU idled half the time and its clock stayed at RPe. Launchpad
+ran at 25-30 fps with 35-68 ms frames (sample of WindowServer, MeowXE3
+1.0.13).
+
+Now debug.nmxfb_blob_ordered (on by default for the panel) also covers
+NMXIntelGPUFB: the plugin only waits for scheduling and numbers its
+command buffers (NMXPending/NMXPublished, as for the VM display), and the
+transaction hands the surface to a thread call that waits until the
+command buffers committed before it are published, then copies the frame
+once and flips it on (iopCopySurface/iopCopyTail, split out of
+performTransactionCopy) and completes the transaction. The wait re-arms
+every 250 us instead of sleeping in 1 ms steps, and is capped at 100 ms.
+The front-buffer re-copy stays off.
+
+Launchpad, 12 s: 38.2 fps instead of 26.4, gaps over 34 ms 65 instead of
+179; the wait per frame averages 1.6 ms. Same kernel imports.
+debug.nmxfb_blob_ordered=0 goes back to WindowServer waiting, live.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NVRM/accel/nvaccel_stubs.h |   2 +
+ kexts/NVRM/accel/nvrm-accel.cpp  | 116 ++++++++++++++++++++++++++++---
+ 2 files changed, 110 insertions(+), 8 deletions(-)
+
+diff --git a/kexts/NVRM/accel/nvaccel_stubs.h b/kexts/NVRM/accel/nvaccel_stubs.h
+index e7d5ced..ce6e6e2 100644
+--- a/kexts/NVRM/accel/nvaccel_stubs.h
++++ b/kexts/NVRM/accel/nvaccel_stubs.h
+@@ -140,6 +140,8 @@ public:
+     IOReturn validateTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     IOReturn performTransaction(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     IOReturn performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn);
++    IOReturn iopCopySurface(IOService *fb, unsigned head, IOSurface *s);   // MeowXE3: also from the ordered panel path
++    IOReturn iopCopyTail(IOService *fb, unsigned head, const volatile unsigned int *src, unsigned w, unsigned h, unsigned pitch, bool fromRes);
+     bool     isTransactionComplete(IOAccelDisplayPipeTransaction2 *txn) APPLE_KEXT_OVERRIDE;
+     void     free() APPLE_KEXT_OVERRIDE;
+     enum { kIopSrcSlots = 4 };
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index a61ff84..33fecc7 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1190,6 +1190,12 @@ static void nvAccelIopHome(IOService *fb, unsigned head);
+ #ifdef NMX_ACCEL
+ static bool nmxOrderedStart(void *pipe, IOService *fb, unsigned head, IOSurface *s);
+ #endif
++static SInt32 gIopK6Logs;
++#ifdef NMX_ACCEL
++static bool nmxPanelOrderedStart(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s);
++static bool nmxPanelOrderedOn();
++static bool nmxPanelOrderedBusy(const void *pipe);
++#endif
+ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *txn)
+ {
+     if (!gNvIop) return (IOReturn)0xe00002c7;
+@@ -1206,7 +1212,6 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+     const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0; bool fromRes = false;
+     NVResource *res = OSDynamicCast(NVResource, ro);
+     NVVidMemory *vm = res ? nvres_vidmem(res) : nullptr;
+-    static SInt32 gIopK6Logs;
+     if (gIopK6Logs < 6) {
+         OSIncrementAtomic(&gIopK6Logs);
+         const unsigned char *kr = (const unsigned char *)res;
+@@ -1232,11 +1237,26 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+     } else if (int b = s ? nmxIopBlobFlip(fb, head, s) : 0) {
+         if (b == 1) { OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]); }
+         return kIOReturnSuccess;
++#endif
++#ifdef NMX_ACCEL
++    } else if (s && nmxPanelOrderedOn() && fb->metaCast("NMXIntelGPUFB") && nmxPanelOrderedStart(this, fb, head, s)) {
++        return kIOReturnSuccess;   // copied and flipped once the GPU has finished the frame (nmxPanelOrderedRun)
+ #endif
+     } else if (s && nvAccelIopFlip(fb, head, s, this)) {
+         OSAddAtomic64(1, &gCntIopSrcSurf); OSAddAtomic64(1, &gCntIopOk); OSAddAtomic64(1, &gCntIopOkHead[head]);
+         return kIOReturnSuccess;
+     } else if (s) {
++        return iopCopySurface(fb, head, s);
++    } else {
++        NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
++    }
++    return iopCopyTail(fb, head, src, w, h, pitch, fromRes);
++}
++
++// The frame in IOSurface s onto head's panel: s's pixels must be in its memory (checked here as before).
++IOReturn NVDisplayPipe::iopCopySurface(IOService *fb, unsigned head, IOSurface *s)
++{
++    const volatile unsigned int *src = nullptr; unsigned w = 0, h = 0, pitch = 0;
+         // A copied frame must come from the surface's newest pixels. Copying while they were still only in VRAM put a
+         // stale, one-colour buffer on the panel every other frame: full-screen flicker, 5 of 40 flicker recordings
+         // (1.13-1.14.1), nvaccel_iop_blank about half of every copied frame, never on machines whose frames all flip.
+@@ -1252,9 +1272,15 @@ IOReturn NVDisplayPipe::performTransactionCopy(IOAccelDisplayPipeTransaction2 *t
+         src = (const volatile unsigned int *)iopMapSurface(s->getSurfaceID(), md, H * P);
+         if (!src) NVIOP_FAIL(kIOReturnVMError, "surface 0x%x would not prepare/map %llu bytes", s->getSurfaceID(), H * P);
+         w = (unsigned)W; h = (unsigned)H; pitch = (unsigned)P;
+-    } else {
+-        NVIOP_FAIL(kIOReturnUnsupported, "plane resource %p is not an NVResource with a CPU mapping, and there is no IOSurface", ro);
+-    }
++    return iopCopyTail(fb, head, src, w, h, pitch, false);
++}
++
++// Copies a frame (src, w x h, pitch) onto head's scan-out, or into the panel's back buffer and flips it on.
++IOReturn NVDisplayPipe::iopCopyTail(IOService *fb, unsigned head, const volatile unsigned int *src, unsigned w, unsigned h,
++                                    unsigned pitch, bool fromRes)
++{
++    NVAccel *a = NVAccel::gAccel;
++    if (!a) NVIOP_FAIL(kIOReturnNotAttached, "no accelerator");
+     if (!w || !h || pitch < 4) NVIOP_FAIL(kIOReturnBadArgument, "source geometry %ux%u pitch %u", w, h, pitch);
+ 
+     struct NVRMVramRequest q;
+@@ -1477,18 +1503,23 @@ static int gNmxBlobOrdered = 1;
+  * GPU had not finished (typed characters showed a frame late) and the 60 Hz front-buffer re-copy that caught up with
+  * them tore. Off: WindowServer waits for the pixels before it presents (NVMTLCommandBuffer
+  * commitAndWaitUntilSubmitted), each frame is copied once, complete. Measured: no tearing or late characters, 51 fps.
++ * MeowXE3 1.0.14: ordered again, now with the panel's own path (nmxPanelOrderedRun), which copies a frame only once the
++ * GPU has published it: Launchpad 37.8 fps instead of 26.4, long gaps 108 instead of 179 in 12 s. debug.nmxfb_blob_ordered=0
++ * goes back to WindowServer waiting, live.
+  */
+ static void nmxPanelDefaults()
+ {
+-    gNmxBlobOrdered = 0;
++    gNmxBlobOrdered = 1;
+     gNmxFrontHz = 0;
+-    ALOG("NMXGPU panel: ordered flips off, front-buffer re-copy off (each finished frame is copied once)");
++    ALOG("NMXGPU panel: ordered frames on (copied once the GPU has published them), front-buffer re-copy off");
+ }
+-static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs;
++static bool nmxPanelOrderedOn() { return gNmxBlobOrdered == 1; }
++static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs, gCntNmxPanelOrdered;
+ SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob_ordered, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobOrdered, 0,
+            "VM display: 1 = a presented surface goes on the panel once its pixels are in its memory (the flip waits on a "
+            "thread call; WindowServer's commit does not wait for the GPU), 0 = flip at once (WindowServer waits)");
+ NVACCEL_CNT(nmxfb_ord_waited, gCntNmxOrdWaited, "VM display: ordered flips that waited for the surface's pixels");
++NVACCEL_CNT(nmxfb_panel_ordered, gCntNmxPanelOrdered, "NMXGPU panel: frames copied by the ordered path (after the GPU finished them)");
+ NVACCEL_CNT(nmxfb_ord_timeout, gCntNmxOrdTimeout, "VM display: ordered flips that gave up waiting (flipped anyway)");
+ NVACCEL_CNT(nmxfb_ord_wait_us, gCntNmxOrdNs, "VM display: total time ordered flips waited, us");
+ static SInt64 gCntNmxFrontWritten;
+@@ -1504,6 +1535,7 @@ static void nmxInstallVmSysctls(void)
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob);
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob_flips);    sysctl_register_oid(&sysctl__debug_nmxfb_blob_refused);
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob_ordered);  sysctl_register_oid(&sysctl__debug_nmxfb_ord_waited);
++    sysctl_register_oid(&sysctl__debug_nmxfb_panel_ordered);
+     sysctl_register_oid(&sysctl__debug_nmxfb_ord_timeout);   sysctl_register_oid(&sysctl__debug_nmxfb_ord_wait_us);
+     sysctl_register_oid(&sysctl__debug_nmxfb_front_written);  sysctl_register_oid(&sysctl__debug_nmxfb_ord_trace);
+ #else
+@@ -1934,7 +1966,7 @@ static bool nvAccelIopAsyncBusy(const void *pipe)
+     for (unsigned h = 0; h < kNvMaxFB; h++)
+         if (gIopAs[h].pipe == pipe && __atomic_load_n(&gIopAs[h].busy, __ATOMIC_ACQUIRE)) return true;
+ #ifdef NMX_ACCEL
+-    if (nmxOrderedBusy(pipe)) return true;
++    if (nmxOrderedBusy(pipe) || nmxPanelOrderedBusy(pipe)) return true;
+ #endif
+     return false;
+ }
+@@ -2124,6 +2156,74 @@ static bool nmxOrderedStart(void *pipe, IOService *fb, unsigned head, IOSurface
+     thread_call_enter(e->call);
+     return true;
+ }
++/*
++ * Ordered frames on NMXGPU's panel (NMXIntelGPUFB, debug.nmxfb_blob_ordered = 1). WindowServer used to wait for the GPU
++ * after every Metal flush (commitAndWaitUntilSubmitted -> waitUntilCompleted) so the copy below found finished pixels:
++ * a frame cost its CPU encoding PLUS its GPU time, the GPU idled half the time and its clock stayed at RPe (Launchpad
++ * at 25-30 fps, 35-68 ms a frame; MeowXE3 1.0.13 sample of WindowServer). Ordered, the plugin only waits for the
++ * command buffer to be scheduled and numbers it (NMXPending / NMXPublished, as for the VM display); the transaction
++ * hands the surface to a thread call that waits for NMXPublished >= NMXPending, then copies the frame once and flips
++ * it on, and completes the transaction (signalTransactionInterrupt), which paces WindowServer. Meanwhile WindowServer
++ * encodes its next frame. The front-buffer re-copy stays off (it tore with unfinished frames).
++ */
++struct NMXPanelOrdered { NVDisplayPipe *pipe; IOService *fb; unsigned head; IOSurface *s; volatile SInt32 busy; struct thread_call *call; uint64_t t0; uint64_t target; };
++static constexpr unsigned kNmxPanelPollUs = 250;   // how often a frame not yet published is looked at again
++static NMXPanelOrdered gNmxPanelOrd[kNvMaxFB];
++static bool nmxPanelOrderedBusy(const void *pipe)
++{
++    for (unsigned h = 0; h < kNvMaxFB; h++)
++        if (gNmxPanelOrd[h].pipe == pipe && __atomic_load_n(&gNmxPanelOrd[h].busy, __ATOMIC_ACQUIRE)) return true;
++    return false;
++}
++// Runs when the transaction comes in and again every kNmxPanelPollUs until the frame is published (re-armed, not
++// sleeping: IOSleep's 1 ms steps cost up to a millisecond of every frame, and nearly every frame waits ~4 ms)
++static void nmxPanelOrderedRun(void *p0, void *)
++{
++    NMXPanelOrdered *e = (NMXPanelOrdered *)p0;
++    IOSurface *s = e->s; NVDisplayPipe *pipe = e->pipe;
++    // the frame presented is the surface's command buffers up to NMXPending at the transaction (e->target): work
++    // committed into it later must not hold this frame back (1 timeout in ~7500 frames waited for such work)
++    const uint64_t pub = nmxPublished(s);
++    const bool ready = e->target == 0 || pub >= e->target;
++    const uint64_t waitedNs = mach_absolute_time() - e->t0;   // x86: the timebase is ns
++    if (!ready && waitedNs < kNmxOrdMaxMs * 1000000ull) {
++        uint64_t d; clock_interval_to_deadline(kNmxPanelPollUs, kMicrosecondScale, &d);
++        thread_call_enter_delayed(e->call, d);
++        return;
++    }
++    e->s = nullptr;
++    if (waitedNs > kNmxPanelPollUs * 1000ull / 2) {
++        OSAddAtomic64(1, ready ? &gCntNmxOrdWaited : &gCntNmxOrdTimeout);
++        OSAddAtomic64((SInt64)(waitedNs / 1000), &gCntNmxOrdNs);
++        if (!ready && gCntNmxOrdTimeout <= 4)
++            ALOG("iop: panel frame of surface 0x%x not published after %u ms (NMXPublished %llu) - copied anyway",
++                 s->getSurfaceID(), (unsigned)(waitedNs / 1000000), (unsigned long long)pub);
++    }
++    if (gNmxFrontLock) IOLockLock(gNmxFrontLock);
++    (void)pipe->iopCopySurface(e->fb, e->head, s);
++    if (gNmxFrontLock) IOLockUnlock(gNmxFrontLock);
++    OSAddAtomic64(1, &gCntNmxPanelOrdered);
++    ((OSObject *)s)->release();
++    __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
++    _ZN18IOAccelDisplayPipe26signalTransactionInterruptEPv(pipe, nullptr);
++    pipe->release();
++}
++// true when the frame was handed to the thread call (the transaction completes later)
++static bool nmxPanelOrderedStart(NVDisplayPipe *pipe, IOService *fb, unsigned head, IOSurface *s)
++{
++    if (!pipe || head >= kNvMaxFB) return false;
++    NMXPanelOrdered *e = &gNmxPanelOrd[head];
++    // the family sends a pipe's next transaction only after the last one completed; wait out a stray overlap
++    for (unsigned i = 0; i < 200 && __atomic_load_n(&e->busy, __ATOMIC_ACQUIRE); i++) IOSleep(1);
++    if (__atomic_load_n(&e->busy, __ATOMIC_ACQUIRE)) return false;
++    if (!e->call) e->call = thread_call_allocate(nmxPanelOrderedRun, e);
++    if (!e->call) return false;
++    ((OSObject *)s)->retain(); pipe->retain();
++    e->pipe = pipe; e->fb = fb; e->head = head; e->s = s; e->t0 = mach_absolute_time(); e->target = nmxSurfaceNumber(s, "NMXPending");
++    __atomic_store_n(&e->busy, 1, __ATOMIC_RELEASE);
++    thread_call_enter(e->call);
++    return true;
++}
+ #endif
+ static bool nvAccelIopFlip(IOService *fb, unsigned head, IOSurface *s, void *pipe)
+ {
+-- 
+2.39.5 (Apple Git-154)
+
