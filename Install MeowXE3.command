@@ -92,7 +92,6 @@ check_system() { # sets CHECK_FAILED / CHECK_WARN
     if [ "$TARGET" = 15 ] && [ "$minor" -lt 5 ]; then
       bad "macOS $mv - the Sequoia build needs 15.5 or newer (OpenGL/Zink is built for 15.5); update macOS first"; CHECK_FAILED=1
     else ok "macOS $mv ($OSNAME)"; fi
-    [ "$TARGET" = 15 ] && { warn "Sequoia build: new, not yet tested on real hardware - keep the 'start once without driver' entry handy"; CHECK_WARN=1; }
   elif [ "$major" = 15 ] || [ "$major" = 26 ]; then
     bad "macOS $mv, but this download is the $OSNAME (macOS $TARGET) build - get the $( [ "$major" = 15 ] && echo "-sequoia" || echo "Tahoe") zip from Releases"
     say "         (the GPU accelerator kext differs between Sequoia and Tahoe; the wrong one leaves a black or frozen desktop)"; CHECK_FAILED=1

@@ -47,7 +47,7 @@ headers change, or the desktop stays black.
 ## Installing on Sequoia
 
 Same installer. It reads `payload/TARGET` and:
-- accepts Sequoia 15.5+ with the `-sequoia` zip, and warns that the build is untested,
+- accepts Sequoia 15.5+ with the `-sequoia` zip,
 - refuses Tahoe with the `-sequoia` zip and Sequoia with the Tahoe zip (the wrong accelerator gives a black or frozen
   desktop),
 - refuses Sequoia older than 15.5.
