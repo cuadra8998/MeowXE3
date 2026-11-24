@@ -72,8 +72,12 @@ Safari's sandbox; not done.
   Frames not published within 100 ms are skipped (patch 0064; copying them anyway showed half-drawn frames). Limiting
   WindowServer to one frame ahead was tried and dropped. The beachball at login seen during these tests is the older
   logout → login hang (the original 1.0.12 build has it too: CONTINUING, open thread 3).
-- **Next:** the GPU clock under compositing (SLPC only ramps under near-constant load), and the CPU side of encoding
-  (`MetalCompositeCoreAnimation`, about a third of WindowServer's frame time). Measure with `tools/tests/frame-gaps.m`.
+- **GPU minimum clock (patch 0113, NMXGPU):** GuC SLPC kept the GT at RPe (900 MHz) under bursty compositing. NMXGPU
+  now asks for a 1500 MHz minimum once at start (NVRAM `meowxe3-gpu-minfreq`: MHz, or 1 = GuC default). Launchpad:
+  frames waiting over 16 ms for the GPU 1.5% (was 5-17%), long gaps 44 instead of ~65 in 12 s, no skipped frames;
+  fps unchanged at ~38, so the next limit is WindowServer's CPU side (`MetalCompositeCoreAnimation`). Frames are still
+  skipped in a burst for a few seconds after login, while every app starts.
+- **Next:** the plugin's submission thread (one command buffer at a time), and the CPU cost of encoding.
 
 ### Others
 - **Minecraft 1.12.2 on Zink:** ~30 fps, limited by presentation copies.

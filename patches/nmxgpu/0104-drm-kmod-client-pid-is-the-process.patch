@@ -24,18 +24,3 @@ index 6d25949..4abfb4c 100644
  #endif
  
  	/*
-@@ -498,7 +500,14 @@ void drm_file_update_pid(struct drm_file *filp)
- #endif
- 	mutex_unlock(&dev->filelist_mutex);
- 
-+	/*
-+	 * FreeBSD: the pid is a plain integer (and task_pid() is the thread id,
-+	 * so this runs for every new calling thread): no reader can hold the old
-+	 * one, so there is no grace period to wait for.
-+	 */
-+#ifdef __linux__
- 	synchronize_rcu();
-+#endif
- 	put_pid(old);
- }
- 

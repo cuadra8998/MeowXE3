@@ -1,0 +1,53 @@
+Subject: [PATCH 0113] GPU minimum clock (meowxe3-gpu-minfreq, default 1500 MHz)
+
+--- a/gpu-port/xkpi/override/xe/nmx_xe_module.c
++++ b/gpu-port/xkpi/override/xe/nmx_xe_module.c
+@@ -38,6 +38,40 @@
+ extern int (*nmx_xe_backlight_hook)(struct drm_device *dev, int set, int *cur);     /* override/src/nmx_fb_bridge.c */
+ extern int (*nmx_xe_gpufreq_hook)(struct drm_device *dev, uint32_t freq[7]);        /* override/src/nmx_fb_bridge.c */
+ 
++int nmx_xnu_nvram_int(const char *key);	/* xnu/nmx_kext.cpp */
++
++/*
++ * MeowXE3: a minimum GPU clock while the GPU is busy. GuC SLPC only raises the clock under near-constant load, and
++ * compositing is bursty: during Launchpad the render GT stayed at RPe (900 of 2300 MHz) while frames waited for it.
++ * NVRAM meowxe3-gpu-minfreq: unset = kNmxMinFreqDefault MHz, a number >= 100 = that many MHz (clamped to RPn..RP0),
++ * 1 = leave the GuC's own minimum. Set once, through xe_guc_pc_set_min_freq (one H2G request, as xe's sysfs min_freq
++ * file does), which xe applies again itself after a GT reset or resume. RC6 still powers the GT down when idle.
++ */
++#define kNmxMinFreqDefault 1500u
++static int nmx_xe_minfreq_done;
++static void nmx_xe_apply_minfreq(struct xe_guc_pc *pc)
++{
++    if (nmx_xe_minfreq_done)
++        return;
++    const int nv = nmx_xnu_nvram_int("meowxe3-gpu-minfreq");
++    if (nv == 1) {
++        nmx_xe_minfreq_done = 1;
++        printf("MeowXE3 GPU: minimum clock left to the GuC (meowxe3-gpu-minfreq=1)\n");
++        return;
++    }
++    const uint32_t rp0 = xe_guc_pc_get_rp0_freq(pc), rpn = xe_guc_pc_get_rpn_freq(pc);
++    if (rp0 == 0)
++        return;     /* frequencies not read yet: try at the next report */
++    uint32_t want = nv >= 100 ? (uint32_t)nv : kNmxMinFreqDefault;
++    if (want > rp0) want = rp0;
++    if (want < rpn) want = rpn;
++    const int err = xe_guc_pc_set_min_freq(pc, want);
++    if (err == -EAGAIN)
++        return;     /* GuC PC not ready (start or reset): next report */
++    nmx_xe_minfreq_done = 1;
++    printf("MeowXE3 GPU: minimum clock %u MHz (RPn %u, RP0 %u; meowxe3-gpu-minfreq %d): %d\n", want, rpn, rp0, nv, err);
++}
++
+ /* MeowXE3: the render GT's clock as the GuC reports it (MHz), for the 5-second report (as xe's sysfs freq0/ files). */
+ static int nmx_xe_gpufreq(struct drm_device *dev, uint32_t freq[7])
+ {
+@@ -50,6 +84,7 @@
+     struct xe_guc_pc *pc = &gt->uc.guc.pc;
+     memset(freq, 0, sizeof(uint32_t) * 7);
+     xe_pm_runtime_get(xe);
++    nmx_xe_apply_minfreq(pc);
+     freq[0] = xe_guc_pc_get_act_freq(pc);
+     xe_guc_pc_get_cur_freq(pc, &freq[1]);
+     /* min/max are not read: each is a GuC request (pc_action_query_task_state) answered while the GuC schedules

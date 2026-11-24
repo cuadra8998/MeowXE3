@@ -98,6 +98,7 @@ git -C "$R/nullmoth" apply "$HERE/0105-panel-brightness.patch"
 git -C "$R/nullmoth" apply "$HERE/0106-gpu-clock-report.patch"
 git -C "$R/nullmoth" apply "$HERE/0107-clock-report-without-guc-queries.patch"
 git -C "$R/nullmoth" apply "$HERE/0108-panther-lake-shipping-ids.patch"
+git -C "$R/nullmoth" apply "$HERE/0113-gpu-minimum-clock.patch"
 echo "patches applied: 50 (ericek) + 0051 (Wildcat Lake) + 0053 (integrated-GPU display bridge) + 0054 (build fixes) + 0055 (bring-up checkpoints, off unless nmxtrace is set) + 0056 (checked BAR mappings) + 0057 (shared BAR mappings kept until the last user) + 0058 (nmxtrace=3 NVRAM breadcrumb) + 0059 (xe display-probe checkpoints) + 0061 (framebuffer publish checkpoints) + 0063 (scan-out buffer checkpoints) + 0065 (stolen scan-out buffer cleared by the CPU) + 0066 (xe GEM vmap) + 0067 (coarse NVRAM breadcrumbs) + 0068 (IOGraphics callback breadcrumbs) + 0069 (interrupt heartbeat) + 0070 (fbstop switch) + 0071 (fbflags switch) + 0072 (NMXGPU stays powered on) + 0073 (fbflags 0x4) + 0074 (flight recorder)"
 
 # 2. drm-kmod with ericek's one patch, FreeBSD and Linux (only the parts the build reads)
