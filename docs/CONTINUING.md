@@ -85,6 +85,11 @@ apps pick up the new plugin when relaunched, and WindowServer at the next login.
    `nmxScanoutBack`/`nmxScanoutFlip`, no `displayModeWillChange/DidChange`). NMXAccel has no sleep/wake code of its own
    (only the framebuffer kexts do). Start by checking whether the display pipe stays busy (`isTransactionComplete`)
    and what the head reports after wake.
+   **Log out → log in hangs** (beachball, then the whole system's log stops; restart needed), also with the original
+   1.0.12 accelerator and plugin (tested 2026-11-23, Sequoia 15.8.3). WindowServer stays up across the logout; the log
+   ends right after the new session's `CGXConstructVirtualFramebuffer` / `CGXVFBSelectOnlineState` (an 8192x4320
+   virtual framebuffer surface is made, as at every boot, where it does not hang). Restarting instead of logging out
+   avoids it.
 4. **Audio:** only via SOF + SoundWire + RT721 (large), or USB/Bluetooth. Don't retry plain HD Audio for the speakers.
 5. **Safari:** port NullMoth's NVWebKitFixup, only with the user's OK.
 6. **Minecraft 1.12.2 speed:** Zink presentation copies (~30 fps).

@@ -65,6 +65,12 @@ Safari's sandbox; not done.
 - **Fix (patch 0063):** ordered frames on the panel. WindowServer no longer waits; a thread call copies each frame once
   its command buffers are published, then completes the transaction. 38 fps, long gaps 179 → 65 in 12 s.
   `debug.nmxfb_blob_ordered=0` switches back live.
+- **Tried and dropped (plugin):** with ordered frames WindowServer still waits in `waitUntilScheduled`, because a command
+  buffer counts as scheduled only when the submission thread reaches it, after the earlier fences. Not waiting at all:
+  same fps (36 vs 38), the kernel wait grew to 5.5 ms a frame and 100 ms stalls became frequent (3 in ~1800 frames,
+  felt as freezes). The diff is kept outside the repo; the real fix is a submission thread that keeps more than one
+  command buffer in flight. (A beachball at login seen during these tests is the older logout → login hang, which the
+  original 1.0.12 build has too: see CONTINUING, open thread 3.)
 - **Next:** the GPU clock under compositing (SLPC only ramps under near-constant load), and the CPU side of encoding
   (`MetalCompositeCoreAnimation`, about a third of WindowServer's frame time). Measure with `tools/tests/frame-gaps.m`.
 
