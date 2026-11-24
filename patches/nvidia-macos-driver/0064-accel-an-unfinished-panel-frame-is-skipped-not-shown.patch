@@ -1,0 +1,75 @@
+From 57b849cc5aaa90401cd00c0279e3fccc34da449b Mon Sep 17 00:00:00 2001
+From: cuadra8998 <cuadra8998@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:47:33 -0800
+Subject: [PATCH 64/65] accel: an unfinished panel frame is skipped, not shown;
+ slow-frame log
+
+A frame the GPU has not published within 100 ms was copied anyway and
+showed half-drawn (Launchpad artifacts while Safari opened). Now the panel
+keeps the previous frame and the next one replaces it. Slow frames (over
+33 ms) and timeouts log the target, NMXPublished and NMXPending, and
+debug.nmxfb_panel_slow counts frames that waited over 16 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ kexts/NVRM/accel/nvrm-accel.cpp | 24 +++++++++++++++++-------
+ 1 file changed, 17 insertions(+), 7 deletions(-)
+
+diff --git a/kexts/NVRM/accel/nvrm-accel.cpp b/kexts/NVRM/accel/nvrm-accel.cpp
+index 33fecc7..8b0e475 100644
+--- a/kexts/NVRM/accel/nvrm-accel.cpp
++++ b/kexts/NVRM/accel/nvrm-accel.cpp
+@@ -1514,12 +1514,14 @@ static void nmxPanelDefaults()
+     ALOG("NMXGPU panel: ordered frames on (copied once the GPU has published them), front-buffer re-copy off");
+ }
+ static bool nmxPanelOrderedOn() { return gNmxBlobOrdered == 1; }
+-static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs, gCntNmxPanelOrdered;
++static SInt64 gCntNmxOrdWaited, gCntNmxOrdTimeout, gCntNmxOrdNs, gCntNmxPanelOrdered, gCntNmxPanelSlow;
++static SInt32 gCntNmxPanelSlowLogs;
+ SYSCTL_INT(_debug, OID_AUTO, nmxfb_blob_ordered, CTLFLAG_RW | CTLFLAG_LOCKED, &gNmxBlobOrdered, 0,
+            "VM display: 1 = a presented surface goes on the panel once its pixels are in its memory (the flip waits on a "
+            "thread call; WindowServer's commit does not wait for the GPU), 0 = flip at once (WindowServer waits)");
+ NVACCEL_CNT(nmxfb_ord_waited, gCntNmxOrdWaited, "VM display: ordered flips that waited for the surface's pixels");
+ NVACCEL_CNT(nmxfb_panel_ordered, gCntNmxPanelOrdered, "NMXGPU panel: frames copied by the ordered path (after the GPU finished them)");
++NVACCEL_CNT(nmxfb_panel_slow, gCntNmxPanelSlow, "NMXGPU panel: ordered frames that waited over 16 ms for the GPU");
+ NVACCEL_CNT(nmxfb_ord_timeout, gCntNmxOrdTimeout, "VM display: ordered flips that gave up waiting (flipped anyway)");
+ NVACCEL_CNT(nmxfb_ord_wait_us, gCntNmxOrdNs, "VM display: total time ordered flips waited, us");
+ static SInt64 gCntNmxFrontWritten;
+@@ -1536,6 +1538,7 @@ static void nmxInstallVmSysctls(void)
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob_flips);    sysctl_register_oid(&sysctl__debug_nmxfb_blob_refused);
+     sysctl_register_oid(&sysctl__debug_nmxfb_blob_ordered);  sysctl_register_oid(&sysctl__debug_nmxfb_ord_waited);
+     sysctl_register_oid(&sysctl__debug_nmxfb_panel_ordered);
++    sysctl_register_oid(&sysctl__debug_nmxfb_panel_slow);
+     sysctl_register_oid(&sysctl__debug_nmxfb_ord_timeout);   sysctl_register_oid(&sysctl__debug_nmxfb_ord_wait_us);
+     sysctl_register_oid(&sysctl__debug_nmxfb_front_written);  sysctl_register_oid(&sysctl__debug_nmxfb_ord_trace);
+ #else
+@@ -2195,13 +2198,20 @@ static void nmxPanelOrderedRun(void *p0, void *)
+     if (waitedNs > kNmxPanelPollUs * 1000ull / 2) {
+         OSAddAtomic64(1, ready ? &gCntNmxOrdWaited : &gCntNmxOrdTimeout);
+         OSAddAtomic64((SInt64)(waitedNs / 1000), &gCntNmxOrdNs);
+-        if (!ready && gCntNmxOrdTimeout <= 4)
+-            ALOG("iop: panel frame of surface 0x%x not published after %u ms (NMXPublished %llu) - copied anyway",
+-                 s->getSurfaceID(), (unsigned)(waitedNs / 1000000), (unsigned long long)pub);
++        if (waitedNs > 16000000ull) OSAddAtomic64(1, &gCntNmxPanelSlow);
++        // a slow or late frame: how far the plugin's publishing was behind (target = NMXPending at the transaction)
++        if ((!ready && gCntNmxOrdTimeout <= 40) || (ready && waitedNs > 33000000ull && gCntNmxPanelSlowLogs++ < 40))
++            ALOG("iop: panel frame of surface 0x%x %s after %u ms: target %llu, NMXPublished %llu, NMXPending now %llu",
++                 s->getSurfaceID(), ready ? "published" : "NOT published, skipped (previous frame kept)", (unsigned)(waitedNs / 1000000),
++                 (unsigned long long)e->target, (unsigned long long)pub, (unsigned long long)nmxSurfaceNumber(s, "NMXPending"));
++    }
++    // A frame the GPU has not finished after kNmxOrdMaxMs is not copied: copied anyway it showed half-drawn (Launchpad
++    // artifacts while Safari opened, MeowXE3 1.0.13 test). The panel keeps the previous frame; the next one replaces it.
++    if (ready) {
++        if (gNmxFrontLock) IOLockLock(gNmxFrontLock);
++        (void)pipe->iopCopySurface(e->fb, e->head, s);
++        if (gNmxFrontLock) IOLockUnlock(gNmxFrontLock);
+     }
+-    if (gNmxFrontLock) IOLockLock(gNmxFrontLock);
+-    (void)pipe->iopCopySurface(e->fb, e->head, s);
+-    if (gNmxFrontLock) IOLockUnlock(gNmxFrontLock);
+     OSAddAtomic64(1, &gCntNmxPanelOrdered);
+     ((OSObject *)s)->release();
+     __atomic_store_n(&e->busy, 0, __ATOMIC_RELEASE);
+-- 
+2.39.5 (Apple Git-154)
+

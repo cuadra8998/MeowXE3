@@ -1,0 +1,142 @@
+From 5a533c54f7afbfcbfada1453b525f46fa3c79a07 Mon Sep 17 00:00:00 2001
+From: cuadra8998 <cuadra8998@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 19:47:33 -0800
+Subject: [PATCH 65/65] plugin: WindowServer does not wait for its GPU work
+ with ordered panel frames
+
+With debug.nmxfb_blob_ordered the accelerator waits for a frame's pixels
+(NMXPending/NMXPublished) before it copies it, so WindowServer's
+commitAndWaitUntilSubmitted now only commits. It used to wait in
+waitUntilScheduled, which here means the submission thread reached the
+buffer, i.e. the earlier GPU work was done: CPU and GPU still took turns.
+Felt clearly snappier in Launchpad; under heavy load (apps opening) frames
+can still lag the GPU by up to ~130 ms, and the accelerator then skips
+them. NVMTL_WS_WAIT_SCHEDULED=1 keeps the old wait.
+
+Diagnostics (non-release builds, capped at 60 lines each in the plugin
+log): numbered command buffers published 30 ms or more after commit, and
+event waits of 8 ms or more.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ plugin/NVMTLDevice.m    | 10 ++++++++++
+ plugin/NVMTLEventSync.m | 14 +++++++++++++-
+ plugin/NVMTLObjects.h   |  1 +
+ plugin/NVMTLObjects.m   | 19 ++++++++++++++++---
+ 4 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/plugin/NVMTLDevice.m b/plugin/NVMTLDevice.m
+index 4512352..cacd596 100644
+--- a/plugin/NVMTLDevice.m
++++ b/plugin/NVMTLDevice.m
+@@ -96,6 +96,16 @@ static int nvlog_dropped(const char *fmt, uint64_t *rep) {
+     }
+     return path;
+ }
++// MeowXE3 diagnostics: a line in the plugin log without nvlog's per-format cap (callers cap themselves)
++void nvmtl_diag(const char *fmt, ...) {
++#if NVMTL_RELEASE
++    (void)fmt; return;
++#endif
++    char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
++    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); struct tm tm; localtime_r(&ts.tv_sec, &tm);
++    FILE *f = fopen(nvmtl_log_path(), "a");
++    if (f) { fprintf(f, "%02d:%02d:%02d.%03ld pid %d MEOWDIAG %s\n", tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000, getpid(), b); fclose(f); }
++}
+ void nvlog(const char *fmt, ...) {
+     uint64_t rep; if (nvlog_dropped(fmt, &rep)) return;
+     char b[512]; va_list a; va_start(a, fmt); vsnprintf(b, sizeof b, fmt, a); va_end(a);
+diff --git a/plugin/NVMTLEventSync.m b/plugin/NVMTLEventSync.m
+index ac641e7..aa8e75f 100644
+--- a/plugin/NVMTLEventSync.m
++++ b/plugin/NVMTLEventSync.m
+@@ -18,6 +18,7 @@ @interface NVMTLSubmissionPart : NSObject {
+     nvmtl_inflight *inflight;
+     int aheadFailed;
+     BOOL waitFolded;
++    uint64_t waitT0;   // MeowXE3 diagnostics: when this event wait was first found unsignalled
+     BOOL aheadEmpty;
+ }
+ @end
+@@ -428,7 +429,18 @@ - (BOOL)nvmtlAdvancePart {
+             return YES;
+         }
+         uint64_t have = ((uint64_t(*)(id,SEL))objc_msgSend)(part->waitEvent,@selector(signaledValue));
+-        if (have < part->value) return NO;
++        if (have < part->value) { if (!part->waitT0) part->waitT0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); return NO; }
++        if (part->waitT0) {
++            const uint64_t ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - part->waitT0) / 1000000;
++            static _Atomic int n; if (ms >= 8 && atomic_fetch_add(&n, 1) < 60) {
++                void nvmtl_diag(const char *fmt, ...);
++                nvmtl_diag("event wait: %llu ms for %s %p (label %s) to reach %llu; command buffer #%lld (label %s), part %lu of %lu",
++                           (unsigned long long)ms, object_getClassName(part->waitEvent), (__bridge void *)part->waitEvent,
++                           [part->waitEvent respondsToSelector:@selector(label)] ? ([[part->waitEvent label] UTF8String] ?: "-") : "?",
++                           (unsigned long long)part->value, _pubN, _label.UTF8String ?: "-", (unsigned long)_nextPart, (unsigned long)_parts.count);
++            }
++            part->waitT0 = 0;
++        }
+     }
+     if (!ahead && part->commands.cb && !part->encoders && !part->resources.count && !part->surfaces.count && !part->scratch.count && nvmtl_skip_empty_on()) {
+         [self nvmtlMarkScheduled];
+diff --git a/plugin/NVMTLObjects.h b/plugin/NVMTLObjects.h
+index ed5d199..2232851 100644
+--- a/plugin/NVMTLObjects.h
++++ b/plugin/NVMTLObjects.h
+@@ -120,6 +120,7 @@ extern id gNVMTLMainDevice;
+   NSMutableSet *_surfDirty;
+   NSMutableSet *_surfAll;         // every IOSurface-backed texture this command buffer writes (ordered VM-display flips)
+   long long _pubN;                // its NMXPending/NMXPublished number, 0 = none
++  uint64_t _tCommitNs;            // MeowXE3 diagnostics: when a numbered command buffer was committed
+   NSMutableSet *_surfOverwrites; // contents defined by writes recorded in this command buffer
+   unsigned _nEnc, _nEnd, _nHandlers, _nStatus, _nEnqueue, _nLabel, _nPresent, _nWait;
+   unsigned _nEncSealed;
+diff --git a/plugin/NVMTLObjects.m b/plugin/NVMTLObjects.m
+index c61bd3f..2b34e94 100644
+--- a/plugin/NVMTLObjects.m
++++ b/plugin/NVMTLObjects.m
+@@ -4853,11 +4853,18 @@ static int nvmtl_flips_ordered(void) {
+     int v = 0; size_t n = sizeof v;
+     return sysctlbyname("debug.nmxfb_blob_ordered", &v, &n, NULL, 0) == 0 && v == 1;
+ }
++// MeowXE3: with ordered flips WindowServer does not wait at all. Here a command buffer counts as scheduled only when
++// the submission thread reaches it, after the earlier ones' fences, so waitUntilScheduled still waited for the previous
++// GPU work (WindowServer sample, Launchpad: ~700 of 2500 update samples). The accelerator waits for the surface's
++// NMXPublished instead (NMXPending is set at commit), and later command buffers on the queue stay in order on the GPU.
++// NVMTL_WS_WAIT_SCHEDULED=1 keeps the wait.
+ - (BOOL)commitAndWaitUntilSubmitted {
+-    static int ws = -1;
++    static int ws = -1, keepWait = -1;
+     if (ws < 0) ws = (getprogname() && !strcmp(getprogname(), "WindowServer")) ? 1 : 0;
++    if (keepWait < 0) { const char *e = getenv("NVMTL_WS_WAIT_SCHEDULED"); keepWait = e && e[0] == '1'; }
+     [self commit];
+-    if (ws && !nvmtl_flips_ordered()) [self waitUntilCompleted]; else [self waitUntilScheduled];
++    if (ws && !nvmtl_flips_ordered()) [self waitUntilCompleted];
++    else if (!ws || keepWait) [self waitUntilScheduled];
+     return self.status != MTLCommandBufferStatusError;
+ }
+ // Ordered VM-display flips (NMXAccel, debug.nmxfb_blob_ordered): a presented surface goes on the panel once every
+@@ -4868,14 +4875,20 @@ - (BOOL)commitAndWaitUntilSubmitted {
+ static void nvmtl_mark_pending(NVMTLCommandBuffer *cb) {
+     if (!cb->_surfAll.count || !nvmtl_flips_ordered()) return;
+     static _Atomic long long counter;
+-    cb->_pubN = ++counter;
++    cb->_pubN = ++counter; cb->_tCommitNs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+     CFNumberRef num = CFNumberCreate(NULL, kCFNumberLongLongType, &cb->_pubN);
+     if (!num) { cb->_pubN = 0; return; }
+     for (NVMTLTexture *t in cb->_surfAll) if (t->_surf) IOSurfaceSetValue(t->_surf, CFSTR("NMXPending"), num);
+     CFRelease(num);
+ }
++void nvmtl_diag(const char *fmt, ...);
+ void nvmtl_mark_published(NVMTLCommandBuffer *cb, NVMTLTexture *t) {
+     if (!cb->_pubN || !t->_surf) return;
++    { const uint64_t ms = (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - cb->_tCommitNs) / 1000000;
++      static _Atomic int n; if (ms >= 30 && atomic_fetch_add(&n, 1) < 60)
++          nvmtl_diag("panel: #%lld (surface %u, %lu parts, label %s) published %llu ms after its commit", cb->_pubN,
++                     (unsigned)IOSurfaceGetID(t->_surf), (unsigned long)cb->_parts.count, cb->_label.UTF8String ?: "-",
++                     (unsigned long long)ms); }
+     CFNumberRef num = CFNumberCreate(NULL, kCFNumberLongLongType, &cb->_pubN);
+     if (num) { IOSurfaceSetValue(t->_surf, CFSTR("NMXPublished"), num); CFRelease(num); }
+ }
+-- 
+2.39.5 (Apple Git-154)
+
